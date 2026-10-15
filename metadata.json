@@ -1,0 +1,6 @@
+{
+  "name": "BloodStock",
+  "description": "Time-aware allocation simulator and constraint-based optimizer for perishable blood components across multi-hospital networks.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
