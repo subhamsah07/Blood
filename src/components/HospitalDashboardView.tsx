@@ -1,4 +1,4 @@
-import React, { useState, useMemo, useEffect } from 'react';
+import React, { useState, useMemo, useEffect, useCallback } from 'react';
 import {
   Building2,
   LogOut,
@@ -29,11 +29,21 @@ import {
   HelpCircle,
 } from 'lucide-react';
 import { HospitalProfile } from '../services/authService';
-import { BloodUnit, BloodRequest, BloodComponentType, BloodGroup, RequestUrgency } from '../types/bloodstock';
+import {
+  BloodUnit,
+  BloodRequest,
+  BloodComponentType,
+  BloodGroup,
+  RequestUrgency,
+  ProposedAllocation,
+  AllocationRunSummary,
+} from '../types/bloodstock';
 import {
   hospitalDataService,
   NetworkRecommendation,
   IncomingHospitalRequest,
+  EligibleDonorMatch,
+  NetworkTransferRecord,
   JAIPUR_TRANSIT_MATRIX,
 } from '../services/hospitalDataService';
 import {
@@ -43,6 +53,16 @@ import {
   COMPONENT_LABELS,
 } from '../services/compatibilityRules';
 import { HospitalSelector } from './HospitalSelector';
+
+export const formatDatetimeLocal = (date: Date): string => {
+  const pad = (n: number) => n.toString().padStart(2, '0');
+  const y = date.getFullYear();
+  const m = pad(date.getMonth() + 1);
+  const d = pad(date.getDate());
+  const hh = pad(date.getHours());
+  const mm = pad(date.getMinutes());
+  return `${y}-${m}-${d}T${hh}:${mm}`;
+};
 
 interface HospitalDashboardViewProps {
   profile: HospitalProfile;
@@ -82,7 +102,7 @@ export const HospitalDashboardView: React.FC<HospitalDashboardViewProps> = ({
   // Add Stock Form State
   const [newStockComponent, setNewStockComponent] = useState<BloodComponentType>('PRBC');
   const [newStockGroup, setNewStockGroup] = useState<BloodGroup>('O_NEG');
-  const [newStockQuantity, setNewStockQuantity] = useState<number>(2);
+  const [newStockQuantity, setNewStockQuantity] = useState<number>(1);
   const [newStockExpiryDays, setNewStockExpiryDays] = useState<number>(35);
   const [newStockDonationDate, setNewStockDonationDate] = useState<string>(
     new Date().toISOString().split('T')[0]
@@ -128,16 +148,59 @@ export const HospitalDashboardView: React.FC<HospitalDashboardViewProps> = ({
   const [reqGroup, setReqGroup] = useState<BloodGroup>('O_NEG');
   const [reqQuantity, setReqQuantity] = useState<number>(2);
   const [reqUrgency, setReqUrgency] = useState<RequestUrgency>('URGENT_SURGERY');
-  const [reqRequiredHours, setReqRequiredHours] = useState<number>(4);
+  const [reqRequiredDateTime, setReqRequiredDateTime] = useState<string>(() =>
+    formatDatetimeLocal(new Date(Date.now() + 4 * 3600 * 1000))
+  );
   const [reqJustification, setReqJustification] = useState<string>('');
   const [reqPatientRef, setReqPatientRef] = useState<string>('');
   const [isSubmittingRequest, setIsSubmittingRequest] = useState<boolean>(false);
   const [requestFeedback, setRequestFeedback] = useState<{ type: 'success' | 'error'; message: string } | null>(null);
 
+  // Eligible donor matches for outgoing requests
+  const [requestDonorsMap, setRequestDonorsMap] = useState<Record<string, EligibleDonorMatch[]>>({});
+  const [isLoadingRequestDonors, setIsLoadingRequestDonors] = useState<boolean>(false);
+  const [cancellingRequestId, setCancellingRequestId] = useState<string | null>(null);
+
+  // Evaluate potential donor hospitals with sufficient eligible stock for requests
+  const fetchEligibleDonors = useCallback(async (reqList: BloodRequest[]) => {
+    if (!reqList || reqList.length === 0) {
+      setRequestDonorsMap({});
+      return;
+    }
+    setIsLoadingRequestDonors(true);
+    try {
+      const results: Record<string, EligibleDonorMatch[]> = {};
+      await Promise.all(
+        reqList.map(async (r) => {
+          const donors = await hospitalDataService.findEligibleDonorsForRequest(r, userHospitals);
+          results[r.id] = donors;
+        })
+      );
+      setRequestDonorsMap(results);
+    } catch (e) {
+      console.warn('Failed to compute eligible donors:', e);
+    } finally {
+      setIsLoadingRequestDonors(false);
+    }
+  }, [userHospitals]);
+
+  useEffect(() => {
+    fetchEligibleDonors(requests);
+  }, [requests, fetchEligibleDonors]);
+
   // Incoming peer requests state
   const [incomingRequests, setIncomingRequests] = useState<IncomingHospitalRequest[]>([]);
   const [isLoadingIncoming, setIsLoadingIncoming] = useState<boolean>(false);
   const [actionFeedback, setActionFeedback] = useState<{ type: 'success' | 'error'; message: string } | null>(null);
+
+  // Centralized Allocation Engine & Transfer Lifecycle State
+  const [allocationSummary, setAllocationSummary] = useState<AllocationRunSummary | null>(null);
+  const [isRunningAllocation, setIsRunningAllocation] = useState<boolean>(false);
+  const [activeTransfers, setActiveTransfers] = useState<NetworkTransferRecord[]>([]);
+  const [transferAuditLogs, setTransferAuditLogs] = useState<any[]>([]);
+  const [isCommittingAlloc, setIsCommittingAlloc] = useState<string | null>(null);
+  const [isDispatchingTx, setIsDispatchingTx] = useState<string | null>(null);
+  const [isDeliveringTx, setIsDeliveringTx] = useState<string | null>(null);
 
   // Load incoming requests from peer hospitals
   const fetchIncoming = async () => {
@@ -152,9 +215,129 @@ export const HospitalDashboardView: React.FC<HospitalDashboardViewProps> = ({
     }
   };
 
+  const fetchTransfersAndLogs = useCallback(async () => {
+    try {
+      const [txs, logs] = await Promise.all([
+        hospitalDataService.getNetworkTransfers(),
+        hospitalDataService.getTransferAuditLogs(),
+      ]);
+      setActiveTransfers(txs);
+      setTransferAuditLogs(logs);
+    } catch (e) {
+      console.warn('Failed to load transfers/audits:', e);
+    }
+  }, []);
+
   useEffect(() => {
     fetchIncoming();
-  }, [profile.id, userHospitals]);
+    fetchTransfersAndLogs();
+  }, [profile.id, userHospitals, fetchTransfersAndLogs]);
+
+  // Execute Centralized Allocation Engine
+  const handleRunAllocation = async () => {
+    setIsRunningAllocation(true);
+    setActionFeedback(null);
+    try {
+      const summary = await hospitalDataService.runNetworkAllocationEngine(userHospitals);
+      setAllocationSummary(summary);
+      setActionFeedback({
+        type: 'success',
+        message: `Allocation Engine complete (${summary.executionTimeMs}ms): Evaluated ${summary.totalRequests} orders. ${summary.totalAllocatedUnits}/${summary.totalRequestedUnits} units recommended for transfer with 0 double-allocations.`,
+      });
+    } catch (e: any) {
+      setActionFeedback({ type: 'error', message: `Allocation engine error: ${e.message}` });
+    } finally {
+      setIsRunningAllocation(false);
+    }
+  };
+
+  // Explicit action to approve/commit an allocation (does NOT auto-dispatch)
+  const handleCommitAllocation = async (alloc: ProposedAllocation) => {
+    setIsCommittingAlloc(alloc.unitId);
+    setActionFeedback(null);
+    try {
+      const sourceHosp = userHospitals.find((h) => h.id === alloc.sourceHospitalId) || profile;
+      const destHosp = userHospitals.find((h) => h.id === alloc.destinationHospitalId) || profile;
+      const res = await hospitalDataService.commitAllocationReservation(
+        sourceHosp,
+        destHosp,
+        alloc.requestId,
+        alloc.unitId,
+        alloc.reason
+      );
+      if (res.success) {
+        setActionFeedback({
+          type: 'success',
+          message: `Allocation committed to RESERVED state. Unit ${alloc.unitId.slice(0, 8)} locked at ${sourceHosp.name}. Awaiting explicit courier dispatch trigger.`,
+        });
+        if (allocationSummary) {
+          setAllocationSummary({
+            ...allocationSummary,
+            allocations: allocationSummary.allocations.filter((a) => a.unitId !== alloc.unitId),
+            totalAllocatedUnits: Math.max(0, allocationSummary.totalAllocatedUnits - 1),
+          });
+        }
+        await onRefreshData();
+        await fetchIncoming();
+        await fetchTransfersAndLogs();
+      } else {
+        setActionFeedback({ type: 'error', message: res.error || 'Failed to commit reservation.' });
+      }
+    } catch (e: any) {
+      setActionFeedback({ type: 'error', message: e.message || 'Error committing allocation.' });
+    } finally {
+      setIsCommittingAlloc(null);
+    }
+  };
+
+  // Explicit action to dispatch courier
+  const handleDispatchTransfer = async (tx: NetworkTransferRecord) => {
+    setIsDispatchingTx(tx.id);
+    setActionFeedback(null);
+    try {
+      const actorHosp = userHospitals.find((h) => h.id === tx.sourceHospitalId) || profile;
+      const res = await hospitalDataService.dispatchTransfer(actorHosp, tx.id, tx.requestId, tx.unitIds);
+      if (res.success) {
+        setActionFeedback({
+          type: 'success',
+          message: `Transfer ${tx.id} marked DISPATCHED! Courier ${tx.courierReference} is in active corridor (~${tx.transitMinutes}m ETA).`,
+        });
+        await onRefreshData();
+        await fetchTransfersAndLogs();
+      } else {
+        setActionFeedback({ type: 'error', message: res.error || 'Failed to dispatch transfer.' });
+      }
+    } catch (e: any) {
+      setActionFeedback({ type: 'error', message: e.message || 'Error dispatching transfer.' });
+    } finally {
+      setIsDispatchingTx(null);
+    }
+  };
+
+  // Explicit action to confirm delivery & receipt
+  const handleConfirmDelivery = async (tx: NetworkTransferRecord) => {
+    setIsDeliveringTx(tx.id);
+    setActionFeedback(null);
+    try {
+      const receivingHosp = userHospitals.find((h) => h.id === tx.destinationHospitalId) || profile;
+      const res = await hospitalDataService.confirmTransferDelivered(receivingHosp, tx.id, tx.requestId, tx.unitIds);
+      if (res.success) {
+        setActionFeedback({
+          type: 'success',
+          message: `Transfer ${tx.id} DELIVERED! Units inspected and added to ${receivingHosp.name} inventory. Request FULFILLED.`,
+        });
+        await onRefreshData();
+        await fetchIncoming();
+        await fetchTransfersAndLogs();
+      } else {
+        setActionFeedback({ type: 'error', message: res.error || 'Failed to confirm delivery.' });
+      }
+    } catch (e: any) {
+      setActionFeedback({ type: 'error', message: e.message || 'Error confirming delivery.' });
+    } finally {
+      setIsDeliveringTx(null);
+    }
+  };
 
   // Deduplicate inventory by unique unit ID to ensure each record is displayed strictly once
   const uniqueUnits = useMemo(() => {
@@ -335,6 +518,7 @@ export const HospitalDashboardView: React.FC<HospitalDashboardViewProps> = ({
           message: `Successfully registered ${res.insertedCount} unit(s) of ${newStockComponent} (${SHORT_BLOOD_GROUPS[newStockGroup]}) into ${statusLabel}.`,
         });
         setNewStockBatchRef('');
+        setNewStockQuantity(1);
         await onRefreshData();
       }
     } catch (err: any) {
@@ -352,40 +536,68 @@ export const HospitalDashboardView: React.FC<HospitalDashboardViewProps> = ({
   const handleCreateRequestSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     setRequestFeedback(null);
+
+    // 1. Positive integer quantity validation
+    const qty = Number(reqQuantity);
+    if (!qty || !Number.isInteger(qty) || qty <= 0) {
+      setRequestFeedback({
+        type: 'error',
+        message: 'Quantity must be a positive integer (at least 1 unit).',
+      });
+      return;
+    }
+
+    // 2. Required-by date and time validation
+    if (!reqRequiredDateTime) {
+      setRequestFeedback({
+        type: 'error',
+        message: 'Please specify the required-by date and time.',
+      });
+      return;
+    }
+
+    const reqDate = new Date(reqRequiredDateTime);
+    if (isNaN(reqDate.getTime()) || reqDate.getTime() <= Date.now()) {
+      setRequestFeedback({
+        type: 'error',
+        message: 'Required-by date and time must be set to a valid future timestamp.',
+      });
+      return;
+    }
+
+    // 3. Clinical justification validation
+    if (!reqJustification || !reqJustification.trim()) {
+      setRequestFeedback({
+        type: 'error',
+        message: 'Clinical justification is required for inter-hospital transfusion logistics.',
+      });
+      return;
+    }
+
     setIsSubmittingRequest(true);
 
     try {
-      // Check current hospital's eligible inventory
-      const existingEligible = usableUnits.filter((u) => {
-        const comp = checkBiologicalCompatibility(u.componentType, u.bloodGroup, reqComponent, reqGroup);
-        return comp.isCompatible;
-      });
-
-      const requiredBy = new Date(Date.now() + reqRequiredHours * 3600 * 1000).toISOString();
+      const requiredByIso = reqDate.toISOString();
       const res = await hospitalDataService.createBloodRequest(profile, {
         componentType: reqComponent,
         bloodGroup: reqGroup,
-        quantity: Number(reqQuantity),
+        quantity: qty,
         urgency: reqUrgency,
-        requiredBy,
-        clinicalJustification: reqJustification,
+        requiredBy: requiredByIso,
+        clinicalJustification: reqJustification.trim(),
         patientCaseRef: reqPatientRef.trim() || undefined,
       });
 
       if (!res.success) {
         setRequestFeedback({ type: 'error', message: res.error || 'Failed to create request.' });
       } else {
-        const advice =
-          existingEligible.length > 0
-            ? `Note: ${existingEligible.length} compatible unit(s) currently exist in local reserves.`
-            : 'Zero local compatible units available — routed to Jaipur regional network.';
-
         setRequestFeedback({
           type: 'success',
-          message: `Inter-hospital request created (ID: ${res.requestId?.slice(0, 8)}). ${advice}`,
+          message: `Inter-hospital request created successfully! Request ID: ${res.requestId}`,
         });
         setReqJustification('');
         setReqPatientRef('');
+        setReqRequiredDateTime(formatDatetimeLocal(new Date(Date.now() + 4 * 3600 * 1000)));
         await onRefreshData();
         await fetchIncoming();
       }
@@ -393,6 +605,34 @@ export const HospitalDashboardView: React.FC<HospitalDashboardViewProps> = ({
       setRequestFeedback({ type: 'error', message: err.message || 'An unexpected error occurred.' });
     } finally {
       setIsSubmittingRequest(false);
+    }
+  };
+
+  // Cancel an outgoing request created by the current hospital
+  const handleCancelRequest = async (requestId: string) => {
+    setCancellingRequestId(requestId);
+    setRequestFeedback(null);
+    try {
+      const res = await hospitalDataService.cancelRequest(profile, requestId);
+      if (res.success) {
+        setRequestFeedback({
+          type: 'success',
+          message: `Request ${requestId.slice(0, 8)} successfully cancelled.`,
+        });
+        await onRefreshData();
+      } else {
+        setRequestFeedback({
+          type: 'error',
+          message: res.error || 'Failed to cancel request.',
+        });
+      }
+    } catch (e: any) {
+      setRequestFeedback({
+        type: 'error',
+        message: e.message || 'Error cancelling request.',
+      });
+    } finally {
+      setCancellingRequestId(null);
     }
   };
 
@@ -572,7 +812,7 @@ export const HospitalDashboardView: React.FC<HospitalDashboardViewProps> = ({
           }`}
         >
           <Box className="w-4 h-4" />
-          <span>B. Blood Inventory ({units.length})</span>
+          <span>B. Blood Inventory ({uniqueUnits.length})</span>
         </button>
 
         <button
@@ -803,7 +1043,7 @@ export const HospitalDashboardView: React.FC<HospitalDashboardViewProps> = ({
                 </span>
               </div>
               <p className="text-xs text-slate-500 mt-0.5">
-                Displaying {filteredUnits.length} of {units.length} total units. Sorted by FEFO (Earliest Expiry first) for clinical safety.
+                Displaying {filteredUnits.length} of {uniqueUnits.length} total units. Sorted by FEFO (Earliest Expiry first) for clinical safety.
               </p>
             </div>
 
@@ -854,7 +1094,7 @@ export const HospitalDashboardView: React.FC<HospitalDashboardViewProps> = ({
                   className="bg-transparent border-none text-slate-700 font-semibold focus:outline-none pr-1 cursor-pointer"
                   title="Filter by Unit Status"
                 >
-                  <option value="ALL">All Statuses ({units.length})</option>
+                  <option value="ALL">All Statuses ({uniqueUnits.length})</option>
                   <option value="AVAILABLE">Available / Usable ({usableUnits.length})</option>
                   <option value="QUARANTINED">Quarantined / In-QC ({quarantinedUnits.length})</option>
                   <option value="RESERVED">Reserved ({reservedUnits.length})</option>
@@ -921,7 +1161,7 @@ export const HospitalDashboardView: React.FC<HospitalDashboardViewProps> = ({
             </div>
           ) : filteredUnits.length === 0 ? (
             /* Honest Empty States */
-            units.length === 0 ? (
+            uniqueUnits.length === 0 ? (
               <div className="p-12 text-center bg-slate-50 rounded-2xl border border-dashed border-slate-300 space-y-3">
                 <Box className="w-10 h-10 text-slate-400 mx-auto" />
                 <h4 className="font-bold text-slate-800 text-base">
@@ -1401,173 +1641,436 @@ export const HospitalDashboardView: React.FC<HospitalDashboardViewProps> = ({
       )}
 
       {/* =========================================================================
-          TAB D: REQUEST BLOOD FORM
+          TAB D: REQUEST BLOOD & REQUEST MANAGEMENT
          ========================================================================= */}
       {activeTab === 'REQUEST_BLOOD' && (
-        <div className="bg-white p-6 rounded-2xl border border-slate-200 shadow-2xs max-w-2xl mx-auto space-y-6 animate-in fade-in duration-150">
-          <div>
-            <h3 className="text-base font-bold text-slate-900 flex items-center gap-2">
-              <Send className="w-5 h-5 text-blue-600" />
-              <span>Request Blood from Regional Network</span>
-            </h3>
-            <p className="text-xs text-slate-500 mt-1">
-              Order blood components for unmet clinical demand at {profile.name}. Peer Jaipur facilities are evaluated using biological compatibility and transit corridors.
-            </p>
-          </div>
-
-          {requestFeedback && (
-            <div
-              className={`p-3.5 rounded-xl border text-xs flex items-start gap-2.5 ${
-                requestFeedback.type === 'success'
-                  ? 'bg-blue-50 border-blue-200 text-blue-900'
-                  : 'bg-red-50 border-red-200 text-red-800'
-              }`}
-            >
-              {requestFeedback.type === 'success' ? (
-                <CheckCircle2 className="w-4 h-4 shrink-0 text-blue-600 mt-0.5" />
-              ) : (
-                <AlertCircle className="w-4 h-4 shrink-0 text-red-600 mt-0.5" />
-              )}
-              <span>{requestFeedback.message}</span>
-            </div>
-          )}
-
-          <form onSubmit={handleCreateRequestSubmit} className="space-y-4">
-            <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+        <div className="space-y-6 animate-in fade-in duration-150">
+          {/* Section 1: Request Blood Form */}
+          <div className="bg-white p-6 rounded-2xl border border-slate-200 shadow-2xs space-y-6">
+            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 pb-3 border-b border-slate-100">
               <div>
-                <label className="block text-xs font-bold text-slate-800 mb-1">
-                  Required Component <span className="text-red-500">*</span>
-                </label>
-                <select
-                  value={reqComponent}
-                  onChange={(e) => setReqComponent(e.target.value as BloodComponentType)}
-                  className="w-full bg-slate-50 border border-slate-300 rounded-xl px-3 py-2 text-xs font-semibold text-slate-800 focus:outline-none focus:ring-2 focus:ring-blue-500"
-                >
-                  <option value="PRBC">Packed Red Blood Cells (PRBC)</option>
-                  <option value="PLATELETS">Platelets (Apheresis)</option>
-                  <option value="FFP">Fresh Frozen Plasma (FFP)</option>
-                  <option value="CRYOPRECIPITATE">Cryoprecipitate (CRYO)</option>
-                </select>
+                <h3 className="text-base font-bold text-slate-900 flex items-center gap-2">
+                  <Send className="w-5 h-5 text-blue-600" />
+                  <span>Request Blood from Regional Network</span>
+                </h3>
+                <p className="text-xs text-slate-500 mt-0.5">
+                  Order blood components for unmet clinical demand at {profile.name}. Peer network facilities are evaluated using validated biological compatibility and transit corridors.
+                </p>
               </div>
-
-              <div>
-                <label className="block text-xs font-bold text-slate-800 mb-1">
-                  Recipient Blood Group <span className="text-red-500">*</span>
-                </label>
-                <select
-                  value={reqGroup}
-                  onChange={(e) => setReqGroup(e.target.value as BloodGroup)}
-                  className="w-full bg-slate-50 border border-slate-300 rounded-xl px-3 py-2 text-xs font-semibold text-slate-800 focus:outline-none focus:ring-2 focus:ring-blue-500 font-mono"
-                >
-                  <option value="O_NEG">O− (O Negative)</option>
-                  <option value="O_POS">O+ (O Positive)</option>
-                  <option value="A_NEG">A− (A Negative)</option>
-                  <option value="A_POS">A+ (A Positive)</option>
-                  <option value="B_NEG">B− (B Negative)</option>
-                  <option value="B_POS">B+ (B Positive)</option>
-                  <option value="AB_NEG">AB− (AB Negative)</option>
-                  <option value="AB_POS">AB+ (AB Positive)</option>
-                </select>
-              </div>
-            </div>
-
-            <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
-              <div>
-                <label className="block text-xs font-bold text-slate-800 mb-1">
-                  Quantity (Units) <span className="text-red-500">*</span>
-                </label>
-                <input
-                  type="number"
-                  min="1"
-                  max="20"
-                  value={reqQuantity}
-                  onChange={(e) => setReqQuantity(parseInt(e.target.value, 10) || 1)}
-                  required
-                  className="w-full bg-slate-50 border border-slate-300 rounded-xl px-3 py-2 text-xs font-semibold text-slate-800 focus:outline-none focus:ring-2 focus:ring-blue-500"
-                />
-              </div>
-
-              <div>
-                <label className="block text-xs font-bold text-slate-800 mb-1">
-                  Clinical Urgency <span className="text-red-500">*</span>
-                </label>
-                <select
-                  value={reqUrgency}
-                  onChange={(e) => setReqUrgency(e.target.value as RequestUrgency)}
-                  className="w-full bg-slate-50 border border-slate-300 rounded-xl px-3 py-2 text-xs font-semibold text-slate-800 focus:outline-none focus:ring-2 focus:ring-blue-500 font-bold"
-                >
-                  <option value="CRITICAL_TRAUMA">CRITICAL_TRAUMA (STAT Emergency)</option>
-                  <option value="URGENT_SURGERY">URGENT_SURGERY (&lt; 4-6 Hours)</option>
-                  <option value="ROUTINE">ROUTINE (Scheduled Surgery)</option>
-                </select>
-              </div>
-
-              <div>
-                <label className="block text-xs font-bold text-slate-800 mb-1">
-                  Required Within (Hours) <span className="text-red-500">*</span>
-                </label>
-                <input
-                  type="number"
-                  min="1"
-                  max="72"
-                  value={reqRequiredHours}
-                  onChange={(e) => setReqRequiredHours(parseInt(e.target.value, 10) || 1)}
-                  required
-                  className="w-full bg-slate-50 border border-slate-300 rounded-xl px-3 py-2 text-xs font-semibold text-slate-800 focus:outline-none focus:ring-2 focus:ring-blue-500"
-                />
-              </div>
-            </div>
-
-            <div>
-              <label className="block text-xs font-bold text-slate-800 mb-1">
-                Clinical Justification & Ward Reference <span className="text-red-500">*</span>
-              </label>
-              <textarea
-                rows={2}
-                required
-                placeholder="e.g. ICU post-operative haemorrhage or acute trauma resuscitation."
-                value={reqJustification}
-                onChange={(e) => setReqJustification(e.target.value)}
-                className="w-full bg-slate-50 border border-slate-300 rounded-xl px-3 py-2 text-xs text-slate-800 focus:outline-none focus:ring-2 focus:ring-blue-500"
-              />
-            </div>
-
-            <div>
-              <label className="block text-xs font-bold text-slate-800 mb-1">
-                Patient Case Identifier (Confidential Hospital Reference)
-              </label>
-              <input
-                type="text"
-                placeholder="e.g. CASE-ICU-772 (Protected reference; not shared publicly)"
-                value={reqPatientRef}
-                onChange={(e) => setReqPatientRef(e.target.value)}
-                className="w-full bg-slate-50 border border-slate-300 rounded-xl px-3 py-2 text-xs font-mono text-slate-800 focus:outline-none focus:ring-2 focus:ring-blue-500"
-              />
-              <span className="text-[10px] text-slate-500 mt-1 block">
-                Complies with patient-data confidentiality: Only minimum case ID is preserved for local reconciliation.
+              <span className="px-2.5 py-1 rounded-full text-[10px] font-bold bg-blue-50 text-blue-800 border border-blue-200 shrink-0 self-start sm:self-auto">
+                Requesting Facility: {profile.name}
               </span>
             </div>
 
-            <button
-              type="submit"
-              disabled={isSubmittingRequest}
-              className="w-full py-3 px-4 bg-blue-600 hover:bg-blue-700 active:bg-blue-800 text-white font-bold rounded-xl text-xs uppercase tracking-wider transition-all shadow-xs flex items-center justify-center gap-2 cursor-pointer disabled:opacity-50"
-            >
-              {isSubmittingRequest ? (
-                <span>Submitting Request...</span>
-              ) : (
-                <>
-                  <Send className="w-4 h-4" />
-                  <span>Submit Inter-Hospital Request</span>
-                </>
-              )}
-            </button>
-          </form>
+            {requestFeedback && (
+              <div
+                className={`p-3.5 rounded-xl border text-xs flex items-start gap-2.5 ${
+                  requestFeedback.type === 'success'
+                    ? 'bg-blue-50 border-blue-200 text-blue-900'
+                    : 'bg-red-50 border-red-200 text-red-800'
+                }`}
+              >
+                {requestFeedback.type === 'success' ? (
+                  <CheckCircle2 className="w-4 h-4 shrink-0 text-blue-600 mt-0.5" />
+                ) : (
+                  <AlertCircle className="w-4 h-4 shrink-0 text-red-600 mt-0.5" />
+                )}
+                <span>{requestFeedback.message}</span>
+              </div>
+            )}
+
+            <form onSubmit={handleCreateRequestSubmit} className="space-y-4">
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                <div>
+                  <label className="block text-xs font-bold text-slate-800 mb-1">
+                    Required Component <span className="text-red-500">*</span>
+                  </label>
+                  <select
+                    value={reqComponent}
+                    onChange={(e) => setReqComponent(e.target.value as BloodComponentType)}
+                    className="w-full bg-slate-50 border border-slate-300 rounded-xl px-3 py-2 text-xs font-semibold text-slate-800 focus:outline-none focus:ring-2 focus:ring-blue-500 cursor-pointer"
+                  >
+                    <option value="PRBC">Packed Red Blood Cells (PRBC)</option>
+                    <option value="PLATELETS">Platelets (Apheresis)</option>
+                    <option value="FFP">Fresh Frozen Plasma (FFP)</option>
+                    <option value="CRYOPRECIPITATE">Cryoprecipitate (CRYO)</option>
+                  </select>
+                </div>
+
+                <div>
+                  <label className="block text-xs font-bold text-slate-800 mb-1">
+                    Recipient Blood Group <span className="text-red-500">*</span>
+                  </label>
+                  <select
+                    value={reqGroup}
+                    onChange={(e) => setReqGroup(e.target.value as BloodGroup)}
+                    className="w-full bg-slate-50 border border-slate-300 rounded-xl px-3 py-2 text-xs font-semibold text-slate-800 focus:outline-none focus:ring-2 focus:ring-blue-500 font-mono cursor-pointer"
+                  >
+                    <option value="O_NEG">O− (O Negative)</option>
+                    <option value="O_POS">O+ (O Positive)</option>
+                    <option value="A_NEG">A− (A Negative)</option>
+                    <option value="A_POS">A+ (A Positive)</option>
+                    <option value="B_NEG">B− (B Negative)</option>
+                    <option value="B_POS">B+ (B Positive)</option>
+                    <option value="AB_NEG">AB− (AB Negative)</option>
+                    <option value="AB_POS">AB+ (AB Positive)</option>
+                  </select>
+                </div>
+              </div>
+
+              <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
+                <div>
+                  <label className="block text-xs font-bold text-slate-800 mb-1">
+                    Quantity (Units) <span className="text-red-500">*</span>
+                  </label>
+                  <input
+                    type="number"
+                    min="1"
+                    step="1"
+                    value={reqQuantity}
+                    onChange={(e) => setReqQuantity(parseInt(e.target.value, 10) || 1)}
+                    required
+                    className="w-full bg-slate-50 border border-slate-300 rounded-xl px-3 py-2 text-xs font-semibold text-slate-800 focus:outline-none focus:ring-2 focus:ring-blue-500"
+                  />
+                  <span className="text-[10px] text-slate-500 mt-0.5 block">Positive integer count</span>
+                </div>
+
+                <div>
+                  <label className="block text-xs font-bold text-slate-800 mb-1">
+                    Clinical Urgency <span className="text-red-500">*</span>
+                  </label>
+                  <select
+                    value={reqUrgency}
+                    onChange={(e) => setReqUrgency(e.target.value as RequestUrgency)}
+                    className="w-full bg-slate-50 border border-slate-300 rounded-xl px-3 py-2 text-xs font-semibold text-slate-800 focus:outline-none focus:ring-2 focus:ring-blue-500 font-bold cursor-pointer"
+                  >
+                    <option value="CRITICAL_TRAUMA">CRITICAL_TRAUMA (STAT Emergency)</option>
+                    <option value="URGENT_SURGERY">URGENT_SURGERY (&lt; 4-6 Hours)</option>
+                    <option value="ROUTINE">ROUTINE (Scheduled Surgery)</option>
+                  </select>
+                </div>
+
+                <div>
+                  <label className="block text-xs font-bold text-slate-800 mb-1">
+                    Required-By Date & Time <span className="text-red-500">*</span>
+                  </label>
+                  <input
+                    type="datetime-local"
+                    value={reqRequiredDateTime}
+                    min={formatDatetimeLocal(new Date())}
+                    onChange={(e) => setReqRequiredDateTime(e.target.value)}
+                    required
+                    className="w-full bg-slate-50 border border-slate-300 rounded-xl px-3 py-2 text-xs font-semibold text-slate-800 focus:outline-none focus:ring-2 focus:ring-blue-500 font-mono"
+                  />
+                  <div className="flex items-center gap-1.5 mt-1.5 flex-wrap">
+                    <span className="text-[10px] text-slate-400">Presets:</span>
+                    <button
+                      type="button"
+                      onClick={() => setReqRequiredDateTime(formatDatetimeLocal(new Date(Date.now() + 2 * 3600 * 1000)))}
+                      className="px-1.5 py-0.5 rounded text-[10px] font-bold bg-red-50 text-red-700 border border-red-200 hover:bg-red-100 cursor-pointer"
+                    >
+                      +2h STAT
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setReqRequiredDateTime(formatDatetimeLocal(new Date(Date.now() + 6 * 3600 * 1000)))}
+                      className="px-1.5 py-0.5 rounded text-[10px] font-bold bg-amber-50 text-amber-700 border border-amber-200 hover:bg-amber-100 cursor-pointer"
+                    >
+                      +6h Urgent
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setReqRequiredDateTime(formatDatetimeLocal(new Date(Date.now() + 24 * 3600 * 1000)))}
+                      className="px-1.5 py-0.5 rounded text-[10px] font-bold bg-blue-50 text-blue-700 border border-blue-200 hover:bg-blue-100 cursor-pointer"
+                    >
+                      +24h Routine
+                    </button>
+                  </div>
+                </div>
+              </div>
+
+              <div>
+                <label className="block text-xs font-bold text-slate-800 mb-1">
+                  Clinical Justification & Transfusion Indication <span className="text-red-500">*</span>
+                </label>
+                <textarea
+                  rows={2}
+                  required
+                  placeholder="e.g. ICU post-operative haemorrhage or acute trauma resuscitation indication."
+                  value={reqJustification}
+                  onChange={(e) => setReqJustification(e.target.value)}
+                  className="w-full bg-slate-50 border border-slate-300 rounded-xl px-3 py-2 text-xs text-slate-800 focus:outline-none focus:ring-2 focus:ring-blue-500"
+                />
+              </div>
+
+              <div>
+                <label className="block text-xs font-bold text-slate-800 mb-1">
+                  Patient Case Reference (Internal Confidential ID)
+                </label>
+                <input
+                  type="text"
+                  placeholder="e.g. CASE-ICU-772 (Protected reference; not shared with external facilities)"
+                  value={reqPatientRef}
+                  onChange={(e) => setReqPatientRef(e.target.value)}
+                  className="w-full bg-slate-50 border border-slate-300 rounded-xl px-3 py-2 text-xs font-mono text-slate-800 focus:outline-none focus:ring-2 focus:ring-blue-500"
+                />
+                <span className="text-[10px] text-slate-500 mt-1 block">
+                  Confidentiality guarantee: Patient names and prescription details are strictly excluded from shared network broadcasts.
+                </span>
+              </div>
+
+              <button
+                type="submit"
+                disabled={isSubmittingRequest}
+                className="w-full py-3 px-4 bg-blue-600 hover:bg-blue-700 active:bg-blue-800 text-white font-bold rounded-xl text-xs uppercase tracking-wider transition-all shadow-xs flex items-center justify-center gap-2 cursor-pointer disabled:opacity-50"
+              >
+                {isSubmittingRequest ? (
+                  <span>Submitting Request...</span>
+                ) : (
+                  <>
+                    <Send className="w-4 h-4" />
+                    <span>Submit Inter-Hospital Request</span>
+                  </>
+                )}
+              </button>
+            </form>
+          </div>
+
+          {/* Section 2: Request Management & Eligible Source Hospitals */}
+          <div className="bg-white p-6 rounded-2xl border border-slate-200 shadow-2xs space-y-4">
+            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 pb-3 border-b border-slate-100">
+              <div>
+                <h3 className="text-base font-bold text-slate-900 flex items-center gap-2">
+                  <FileText className="w-5 h-5 text-indigo-600" />
+                  <span>Request Management: Outgoing Inter-Hospital Orders</span>
+                </h3>
+                <p className="text-xs text-slate-500 mt-0.5">
+                  Tracking active blood component requests created by {profile.name} with real-time eligible source hospital discovery.
+                </p>
+              </div>
+
+              <div className="flex items-center gap-2 shrink-0">
+                <button
+                  type="button"
+                  onClick={() => fetchEligibleDonors(requests)}
+                  disabled={isLoadingRequestDonors}
+                  className="p-1.5 px-3 rounded-lg bg-slate-50 hover:bg-slate-100 border border-slate-200 text-slate-700 text-xs font-semibold flex items-center gap-1.5 cursor-pointer transition-colors"
+                >
+                  <RotateCw className={`w-3.5 h-3.5 text-blue-600 ${isLoadingRequestDonors ? 'animate-spin' : ''}`} />
+                  <span>Refresh Potential Donors</span>
+                </button>
+              </div>
+            </div>
+
+            {requests.length === 0 ? (
+              <div className="p-8 text-center bg-slate-50 rounded-xl border border-dashed border-slate-200 space-y-1">
+                <Box className="w-8 h-8 text-slate-400 mx-auto" />
+                <h4 className="font-bold text-slate-800 text-xs">No blood requests currently registered</h4>
+                <p className="text-[11px] text-slate-500">
+                  {profile.name} has not placed any inter-hospital blood component orders yet. Use the form above to order needed stock.
+                </p>
+              </div>
+            ) : (
+              <div className="space-y-4">
+                {requests.map((req) => {
+                  const donors = requestDonorsMap[req.id] || [];
+                  const isPastDeadline = new Date(req.deadlineAt).getTime() <= Date.now();
+                  const hoursRemaining = Math.max(0, (new Date(req.deadlineAt).getTime() - Date.now()) / (3600 * 1000));
+
+                  return (
+                    <div
+                      key={req.id}
+                      className="p-4 sm:p-5 rounded-2xl border border-slate-200 hover:border-blue-300 bg-white transition-all shadow-2xs space-y-3.5"
+                    >
+                      {/* Top Header: Request ID, Urgency, Status */}
+                      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2.5 pb-2.5 border-b border-slate-100">
+                        <div className="flex items-center gap-2 flex-wrap">
+                          <span className="font-mono text-xs font-bold text-slate-900 bg-slate-100 px-2.5 py-0.5 rounded-md border border-slate-200">
+                            ID: {req.id}
+                          </span>
+                          <span
+                            className={`px-2 py-0.5 rounded text-[10px] font-bold uppercase tracking-wider ${
+                              req.urgency === 'CRITICAL_TRAUMA'
+                                ? 'bg-red-100 text-red-800 border border-red-200'
+                                : req.urgency === 'URGENT_SURGERY'
+                                ? 'bg-amber-100 text-amber-800 border border-amber-200'
+                                : 'bg-blue-100 text-blue-800 border border-blue-200'
+                            }`}
+                          >
+                            {req.urgency === 'CRITICAL_TRAUMA'
+                              ? 'STAT / CRITICAL'
+                              : req.urgency === 'URGENT_SURGERY'
+                              ? 'URGENT'
+                              : 'ROUTINE'}
+                          </span>
+                          {req.patientCaseId && (
+                            <span className="text-[10px] font-mono text-slate-400">
+                              Ref: {req.patientCaseId}
+                            </span>
+                          )}
+                        </div>
+
+                        <div className="flex items-center gap-2">
+                          <span
+                            className={`px-2.5 py-0.5 rounded-full text-[10px] font-bold ${
+                              req.status === 'PENDING'
+                                ? 'bg-amber-100 text-amber-900 border border-amber-200'
+                                : req.status === 'PARTIALLY_ALLOCATED'
+                                ? 'bg-blue-100 text-blue-900 border border-blue-200'
+                                : req.status === 'ALLOCATED' || req.status === 'FULFILLED'
+                                ? 'bg-emerald-100 text-emerald-900 border border-emerald-200'
+                                : 'bg-slate-100 text-slate-700 border border-slate-200'
+                            }`}
+                          >
+                            Status: {req.status}
+                          </span>
+                        </div>
+                      </div>
+
+                      {/* Request Specifications */}
+                      <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 text-xs">
+                        <div className="p-2.5 bg-slate-50 rounded-xl border border-slate-100">
+                          <span className="text-[10px] text-slate-500 block">Component</span>
+                          <strong className="text-slate-900 font-semibold">
+                            {COMPONENT_LABELS[req.componentType] || req.componentType}
+                          </strong>
+                        </div>
+
+                        <div className="p-2.5 bg-slate-50 rounded-xl border border-slate-100">
+                          <span className="text-[10px] text-slate-500 block">Required Blood Group</span>
+                          <strong className="text-slate-900 font-mono font-bold">
+                            {SHORT_BLOOD_GROUPS[req.bloodGroup] || req.bloodGroup}
+                          </strong>
+                        </div>
+
+                        <div className="p-2.5 bg-slate-50 rounded-xl border border-slate-100">
+                          <span className="text-[10px] text-slate-500 block">Requested Quantity</span>
+                          <strong className="text-slate-900 font-bold">{req.quantity} Unit(s)</strong>
+                        </div>
+
+                        <div className="p-2.5 bg-slate-50 rounded-xl border border-slate-100">
+                          <span className="text-[10px] text-slate-500 block">Required By</span>
+                          <strong className={`font-mono ${isPastDeadline ? 'text-red-700' : 'text-slate-900'}`}>
+                            {new Date(req.deadlineAt).toLocaleTimeString([], {
+                              hour: '2-digit',
+                              minute: '2-digit',
+                              month: 'short',
+                              day: 'numeric',
+                            })}
+                          </strong>
+                          <span className="text-[10px] text-slate-500 block">
+                            {isPastDeadline ? 'Deadline Passed' : `in ~${hoursRemaining.toFixed(1)}h`}
+                          </span>
+                        </div>
+                      </div>
+
+                      {/* Eligible Source Hospitals Section */}
+                      <div className="p-3.5 bg-slate-50/80 rounded-xl border border-slate-200 space-y-2.5">
+                        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-1">
+                          <div className="flex items-center gap-1.5 text-xs font-bold text-slate-800">
+                            <Truck className="w-3.5 h-3.5 text-indigo-600" />
+                            <span>Eligible Source Hospitals</span>
+                          </div>
+                          <span className="text-[10px] text-slate-500">
+                            Excludes incompatible, quarantined, expired & transit-infeasible stock
+                          </span>
+                        </div>
+
+                        {isLoadingRequestDonors ? (
+                          <div className="flex items-center gap-2 text-xs text-slate-500 py-2">
+                            <RotateCw className="w-3.5 h-3.5 animate-spin text-blue-600" />
+                            <span>Evaluating live network inventory & transit corridors...</span>
+                          </div>
+                        ) : donors.length > 0 ? (
+                          <div className="grid grid-cols-1 md:grid-cols-2 gap-2.5">
+                            {donors.map((donor) => (
+                              <div
+                                key={donor.hospitalId}
+                                className={`p-3 rounded-xl border text-xs transition-colors ${
+                                  donor.hasSufficientStock
+                                    ? 'bg-emerald-50/60 border-emerald-200'
+                                    : 'bg-amber-50/50 border-amber-200'
+                                }`}
+                              >
+                                <div className="flex items-center justify-between gap-2">
+                                  <span className="font-bold text-slate-900 truncate">
+                                    {donor.hospitalName}
+                                  </span>
+                                  <span
+                                    className={`px-2 py-0.5 rounded text-[10px] font-bold shrink-0 ${
+                                      donor.hasSufficientStock
+                                        ? 'bg-emerald-100 text-emerald-800 border border-emerald-200'
+                                        : 'bg-amber-100 text-amber-800 border border-amber-200'
+                                    }`}
+                                  >
+                                    {donor.hasSufficientStock
+                                      ? `Sufficient Stock (≥ ${req.quantity})`
+                                      : `Partial Stock (${donor.availableCount}/${req.quantity})`}
+                                  </span>
+                                </div>
+
+                                <div className="flex items-center justify-between mt-1.5 text-[11px] text-slate-600">
+                                  <span>
+                                    Compatible Usable Units: <strong>{donor.availableCount}</strong>
+                                  </span>
+                                  <span className="font-mono text-indigo-700 font-semibold">
+                                    Corridor ETA: ~{donor.transitMinutes}m
+                                  </span>
+                                </div>
+
+                                <div className="mt-1.5 pt-1.5 border-t border-slate-200/60 flex items-center justify-between text-[10px]">
+                                  <span className="text-emerald-700 font-semibold flex items-center gap-1">
+                                    <Check className="w-3 h-3 text-emerald-600" />
+                                    <span>Biologically Compatible & Transit Feasible</span>
+                                  </span>
+                                  <span className="text-slate-500 italic">
+                                    Recommended Potential Donor
+                                  </span>
+                                </div>
+                              </div>
+                            ))}
+                          </div>
+                        ) : (
+                          <div className="p-3 bg-white rounded-lg border border-dashed border-slate-200 text-xs text-slate-500 text-center">
+                            No authorized network facilities currently possess compatible, unexpired stock that can feasibly arrive before the required deadline.
+                          </div>
+                        )}
+                      </div>
+
+                      {/* Request Action Row */}
+                      {req.status === 'PENDING' && (
+                        <div className="flex justify-end pt-1">
+                          <button
+                            type="button"
+                            disabled={cancellingRequestId === req.id}
+                            onClick={() => handleCancelRequest(req.id)}
+                            className="px-3 py-1.5 bg-slate-100 hover:bg-red-50 text-slate-700 hover:text-red-700 border border-slate-200 hover:border-red-200 font-bold rounded-xl text-xs transition-colors cursor-pointer disabled:opacity-50 flex items-center gap-1.5"
+                          >
+                            {cancellingRequestId === req.id ? (
+                              <>
+                                <RotateCw className="w-3 h-3 animate-spin text-red-600" />
+                                <span>Cancelling...</span>
+                              </>
+                            ) : (
+                              <>
+                                <X className="w-3 h-3" />
+                                <span>Cancel Request</span>
+                              </>
+                            )}
+                          </button>
+                        </div>
+                      )}
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+          </div>
         </div>
       )}
 
       {/* =========================================================================
-          TAB E: NETWORK FULFILMENT & PEER REQUESTS
+          TAB E: NETWORK FULFILMENT & INTELLIGENT ALLOCATION WORKFLOW
          ========================================================================= */}
       {activeTab === 'NETWORK_FULFILMENT' && (
         <div className="space-y-6 animate-in fade-in duration-150">
@@ -1588,7 +2091,392 @@ export const HospitalDashboardView: React.FC<HospitalDashboardViewProps> = ({
             </div>
           )}
 
-          {/* Incoming Requests Section: Donor Fulfilment */}
+          {/* Section 1: Centralized Intelligent Allocation Engine */}
+          <div className="bg-white p-6 rounded-2xl border border-slate-200 shadow-2xs space-y-5">
+            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 pb-4 border-b border-slate-100">
+              <div>
+                <div className="flex items-center gap-2">
+                  <Sparkles className="w-5 h-5 text-blue-600" />
+                  <h3 className="text-base font-bold text-slate-900">
+                    Intelligent Multi-Hospital Blood Allocation Engine
+                  </h3>
+                  <span className="px-2 py-0.5 rounded text-[10px] font-bold uppercase tracking-wider bg-blue-100 text-blue-800 border border-blue-200">
+                    Deterministic CP-SAT Formulation
+                  </span>
+                </div>
+                <p className="text-xs text-slate-500 mt-1 max-w-2xl leading-relaxed">
+                  Evaluates competing emergency and routine requests across all network hospitals against unreserved available stock.
+                  Enforces validated biological compatibility, delivery deadline windows, source safety reserves, and First-Expired First-Out (FEFO) spoilage reduction with zero double-allocation.
+                </p>
+              </div>
+
+              <div className="flex items-center gap-2 shrink-0">
+                <button
+                  type="button"
+                  onClick={handleRunAllocation}
+                  disabled={isRunningAllocation}
+                  className="px-4 py-2.5 bg-blue-600 hover:bg-blue-700 active:bg-blue-800 text-white font-bold rounded-xl text-xs uppercase tracking-wider transition-all shadow-xs flex items-center gap-2 cursor-pointer disabled:opacity-50"
+                >
+                  <RotateCw className={`w-3.5 h-3.5 ${isRunningAllocation ? 'animate-spin' : ''}`} />
+                  <span>{isRunningAllocation ? 'Solving Model...' : 'Run Allocation Engine'}</span>
+                </button>
+              </div>
+            </div>
+
+            {/* Solver Run Summary Metrics (if run) */}
+            {allocationSummary && (
+              <div className="space-y-4">
+                <div className="grid grid-cols-2 sm:grid-cols-4 lg:grid-cols-6 gap-3">
+                  <div className="p-3 bg-slate-50 rounded-xl border border-slate-200">
+                    <span className="text-[10px] text-slate-500 uppercase font-semibold block">Solver Status</span>
+                    <strong
+                      className={`text-sm font-extrabold ${
+                        allocationSummary.solverStatus === 'OPTIMAL'
+                          ? 'text-emerald-700'
+                          : allocationSummary.solverStatus === 'FEASIBLE'
+                          ? 'text-blue-700'
+                          : 'text-amber-700'
+                      }`}
+                    >
+                      {allocationSummary.solverStatus}
+                    </strong>
+                    <span className="text-[10px] text-slate-400 block mt-0.5 font-mono">
+                      in {allocationSummary.executionTimeMs} ms
+                    </span>
+                  </div>
+
+                  <div className="p-3 bg-slate-50 rounded-xl border border-slate-200">
+                    <span className="text-[10px] text-slate-500 uppercase font-semibold block">Total Demand</span>
+                    <strong className="text-sm font-extrabold text-slate-900">
+                      {allocationSummary.totalRequestedUnits} units
+                    </strong>
+                    <span className="text-[10px] text-slate-500 block mt-0.5">
+                      across {allocationSummary.totalRequests} orders
+                    </span>
+                  </div>
+
+                  <div className="p-3 bg-emerald-50/60 rounded-xl border border-emerald-200">
+                    <span className="text-[10px] text-emerald-800 uppercase font-semibold block">Recommended Matches</span>
+                    <strong className="text-sm font-extrabold text-emerald-800">
+                      {allocationSummary.totalAllocatedUnits} units
+                    </strong>
+                    <span className="text-[10px] text-emerald-700 block mt-0.5">
+                      {allocationSummary.totalRequestedUnits > 0
+                        ? Math.round((allocationSummary.totalAllocatedUnits / allocationSummary.totalRequestedUnits) * 100)
+                        : 0}
+                      % fulfillment
+                    </span>
+                  </div>
+
+                  <div className="p-3 bg-rose-50/60 rounded-xl border border-rose-200">
+                    <span className="text-[10px] text-rose-800 uppercase font-semibold block">Unmet Demand</span>
+                    <strong className="text-sm font-extrabold text-rose-800">
+                      {allocationSummary.unmetDemandUnits} units
+                    </strong>
+                    <span className="text-[10px] text-rose-700 block mt-0.5">
+                      {allocationSummary.unmetDemandUnits > 0 ? 'Deficit diagnosed' : 'Zero unmet deficit'}
+                    </span>
+                  </div>
+
+                  <div className="p-3 bg-blue-50/60 rounded-xl border border-blue-200">
+                    <span className="text-[10px] text-blue-800 uppercase font-semibold block">Emergency Fulfillment</span>
+                    <strong className="text-sm font-extrabold text-blue-800">
+                      {allocationSummary.criticalDemandFulfilled}/{allocationSummary.criticalDemandTotal} STAT
+                    </strong>
+                    <span className="text-[10px] text-blue-700 block mt-0.5">
+                      Priority Rule A override
+                    </span>
+                  </div>
+
+                  <div className="p-3 bg-indigo-50/60 rounded-xl border border-indigo-200">
+                    <span className="text-[10px] text-indigo-800 uppercase font-semibold block">Avg Corridor Transit</span>
+                    <strong className="text-sm font-extrabold text-indigo-800">
+                      ~{allocationSummary.averageTransitMinutes} min
+                    </strong>
+                    <span className="text-[10px] text-indigo-700 block mt-0.5">
+                      Simulated Transit Corridor
+                    </span>
+                  </div>
+                </div>
+
+                {/* Proposed / Recommended Allocations List */}
+                <div className="space-y-3">
+                  <div className="flex items-center justify-between">
+                    <h4 className="text-xs font-bold text-slate-800 flex items-center gap-1.5 uppercase tracking-wider">
+                      <span>Proposed Inter-Hospital Allocations</span>
+                      <span className="px-2 py-0.5 bg-amber-100 text-amber-900 border border-amber-300 rounded text-[10px] font-semibold lowercase">
+                        recommendation only · pending explicit approval
+                      </span>
+                    </h4>
+                  </div>
+
+                  {allocationSummary.allocations.length === 0 ? (
+                    <div className="p-6 bg-slate-50 rounded-xl border border-dashed border-slate-200 text-xs text-slate-500 text-center space-y-1">
+                      <CheckCircle2 className="w-5 h-5 text-emerald-600 mx-auto" />
+                      <p className="font-semibold text-slate-700">No active allocations recommended</p>
+                      <p className="text-[11px]">
+                        All pending orders are satisfied, or no unreserved units can feasibly arrive before the requested deadlines.
+                      </p>
+                    </div>
+                  ) : (
+                    <div className="space-y-3">
+                      {allocationSummary.allocations.map((alloc, idx) => {
+                        const sourceHospName =
+                          userHospitals.find((h) => h.id === alloc.sourceHospitalId)?.name ||
+                          'Source Facility';
+                        const destHospName =
+                          userHospitals.find((h) => h.id === alloc.destinationHospitalId)?.name ||
+                          'Destination Facility';
+                        const isCommitting = isCommittingAlloc === alloc.unitId;
+
+                        return (
+                          <div
+                            key={`${alloc.requestId}-${alloc.unitId}-${idx}`}
+                            className="p-4 rounded-xl border border-blue-200 bg-blue-50/20 hover:bg-blue-50/40 transition-all flex flex-col lg:flex-row lg:items-center justify-between gap-4"
+                          >
+                            <div className="space-y-1.5 min-w-0">
+                              <div className="flex items-center gap-2 flex-wrap">
+                                <span className="font-mono text-[10px] bg-blue-600 text-white px-2 py-0.5 rounded font-bold">
+                                  RECOMMENDED MATCH
+                                </span>
+                                <span className="text-xs font-bold text-slate-900 flex items-center gap-1.5">
+                                  <span>{sourceHospName}</span>
+                                  <ArrowRight className="w-3.5 h-3.5 text-slate-400" />
+                                  <span className="text-blue-900">{destHospName}</span>
+                                </span>
+                              </div>
+
+                              <div className="flex items-center gap-3 text-xs text-slate-700 flex-wrap">
+                                <span>
+                                  Unit: <strong className="font-mono">{alloc.unitId.slice(0, 8)}...</strong>
+                                </span>
+                                <span>·</span>
+                                <span>
+                                  Component: <strong>{alloc.componentType} ({alloc.bloodGroup})</strong>
+                                </span>
+                                <span>·</span>
+                                <span className="text-indigo-800 font-semibold font-mono">
+                                  Corridor ETA: ~{alloc.travelMinutes}m (Simulated)
+                                </span>
+                                <span>·</span>
+                                <span className="text-slate-500">
+                                  Arrival by: {new Date(alloc.estimatedArrival).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
+                                </span>
+                              </div>
+
+                              {/* Clinical Reasoning & Explainability Badge */}
+                              <div className="p-2.5 bg-white rounded-lg border border-slate-200 text-[11px] text-slate-700 leading-relaxed">
+                                <strong className="text-blue-800 font-semibold block mb-0.5">
+                                  Clinical Reasoning & Sieve Breakdown:
+                                </strong>
+                                {alloc.reason}
+                              </div>
+                            </div>
+
+                            {/* Explicit Action to Approve and Reserve */}
+                            <div className="shrink-0 flex items-center gap-2">
+                              <button
+                                type="button"
+                                disabled={isCommitting}
+                                onClick={() => handleCommitAllocation(alloc)}
+                                className="px-4 py-2.5 bg-indigo-600 hover:bg-indigo-700 active:bg-indigo-800 text-white font-bold rounded-xl text-xs uppercase tracking-wider transition-all shadow-xs flex items-center gap-1.5 cursor-pointer disabled:opacity-50"
+                              >
+                                {isCommitting ? (
+                                  <>
+                                    <RotateCw className="w-3.5 h-3.5 animate-spin" />
+                                    <span>Reserving...</span>
+                                  </>
+                                ) : (
+                                  <>
+                                    <Check className="w-3.5 h-3.5" />
+                                    <span>Approve & Reserve</span>
+                                  </>
+                                )}
+                              </button>
+                            </div>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  )}
+                </div>
+
+                {/* Section 1b: Unfulfilled Demand Diagnostics & Blocker Reasoning */}
+                {allocationSummary.unfulfilledRequests && allocationSummary.unfulfilledRequests.length > 0 && (
+                  <div className="p-4 bg-rose-50/70 rounded-xl border border-rose-200 space-y-3">
+                    <div className="flex items-center gap-2">
+                      <AlertCircle className="w-4 h-4 text-rose-700" />
+                      <h4 className="text-xs font-bold text-rose-900 uppercase tracking-wider">
+                        Unmet Demand Diagnostics ({allocationSummary.unfulfilledRequests.length} orders impacted)
+                      </h4>
+                    </div>
+                    <p className="text-[11px] text-rose-800">
+                      The constraint solver could not safely fulfill the following demand without violating hard constraints (biological compatibility, expiry, deadline, or source reserve floors):
+                    </p>
+
+                    <div className="space-y-2">
+                      {allocationSummary.unfulfilledRequests.map((unmet) => {
+                        const hospName =
+                          userHospitals.find((h) => h.id === unmet.hospitalId)?.name || 'Requesting Hospital';
+                        return (
+                          <div
+                            key={unmet.requestId}
+                            className="p-3 bg-white rounded-lg border border-rose-200 text-xs space-y-1"
+                          >
+                            <div className="flex items-center justify-between font-semibold">
+                              <span className="text-slate-900">
+                                {hospName} · {unmet.componentType} ({unmet.bloodGroup})
+                              </span>
+                              <span className="text-rose-700 font-bold">
+                                Deficit: {unmet.unmetQuantity} of {unmet.requestedQuantity} unit(s) unmet
+                              </span>
+                            </div>
+                            <p className="text-[11px] text-slate-600">
+                              <strong className="text-slate-800">Primary Blocker:</strong> {unmet.primaryBlocker}
+                            </p>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  </div>
+                )}
+              </div>
+            )}
+          </div>
+
+          {/* Section 2: Active Inter-Hospital Transfers & Courier Lifecycle Manager */}
+          <div className="bg-white p-6 rounded-2xl border border-slate-200 shadow-2xs space-y-4">
+            <div className="flex items-center justify-between">
+              <div>
+                <h3 className="text-sm font-bold text-slate-900 flex items-center gap-2">
+                  <Truck className="w-4 h-4 text-indigo-600" />
+                  <span>Network Transfers & Courier Lifecycle</span>
+                </h3>
+                <p className="text-xs text-slate-500 mt-0.5">
+                  Track and manage committed transfers through four distinct lifecycle states: Recommended → Reserved → Dispatched → Delivered.
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={fetchTransfersAndLogs}
+                className="p-1.5 rounded-lg bg-slate-50 hover:bg-slate-100 border border-slate-200 text-slate-600 text-xs font-semibold flex items-center gap-1 cursor-pointer"
+              >
+                <RotateCw className="w-3.5 h-3.5 text-blue-600" />
+                <span>Refresh Status</span>
+              </button>
+            </div>
+
+            {activeTransfers.length === 0 ? (
+              <div className="p-8 text-center bg-slate-50 rounded-xl border border-dashed border-slate-200 space-y-1">
+                <Box className="w-6 h-6 text-slate-400 mx-auto" />
+                <h4 className="font-bold text-slate-800 text-xs">No active transfer corridors</h4>
+                <p className="text-[11px] text-slate-500">
+                  Approved allocations will appear here for courier dispatch and delivery verification.
+                </p>
+              </div>
+            ) : (
+              <div className="space-y-3">
+                {activeTransfers.map((tx) => {
+                  const isDispatching = isDispatchingTx === tx.id;
+                  const isDelivering = isDeliveringTx === tx.id;
+
+                  return (
+                    <div
+                      key={tx.id}
+                      className="p-4 rounded-xl border border-slate-200 hover:border-indigo-300 bg-white transition-all shadow-2xs space-y-3"
+                    >
+                      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2.5 pb-2 border-b border-slate-100">
+                        <div className="flex items-center gap-2 flex-wrap">
+                          <span className="font-mono text-xs font-bold text-slate-900 bg-slate-100 px-2 py-0.5 rounded">
+                            {tx.id}
+                          </span>
+                          <span
+                            className={`px-2.5 py-0.5 rounded-full text-[10px] font-bold ${
+                              tx.status === 'RESERVED'
+                                ? 'bg-amber-100 text-amber-900 border border-amber-300'
+                                : tx.status === 'DISPATCHED'
+                                ? 'bg-indigo-100 text-indigo-900 border border-indigo-300'
+                                : tx.status === 'DELIVERED'
+                                ? 'bg-emerald-100 text-emerald-900 border border-emerald-300'
+                                : 'bg-slate-100 text-slate-700'
+                            }`}
+                          >
+                            Status: {tx.status}
+                          </span>
+                          <span className="text-[10px] font-mono text-slate-500">
+                            Courier: {tx.courierReference}
+                          </span>
+                        </div>
+
+                        {/* Lifecycle Action Buttons */}
+                        <div className="flex items-center gap-2">
+                          {tx.status === 'RESERVED' && (
+                            <button
+                              type="button"
+                              disabled={isDispatching}
+                              onClick={() => handleDispatchTransfer(tx)}
+                              className="px-3.5 py-1.5 bg-indigo-600 hover:bg-indigo-700 active:bg-indigo-800 text-white font-bold rounded-xl text-xs transition-colors shadow-xs flex items-center gap-1.5 cursor-pointer disabled:opacity-50"
+                            >
+                              {isDispatching ? (
+                                <RotateCw className="w-3.5 h-3.5 animate-spin" />
+                              ) : (
+                                <Truck className="w-3.5 h-3.5" />
+                              )}
+                              <span>Dispatch Courier</span>
+                            </button>
+                          )}
+
+                          {tx.status === 'DISPATCHED' && (
+                            <button
+                              type="button"
+                              disabled={isDelivering}
+                              onClick={() => handleConfirmDelivery(tx)}
+                              className="px-3.5 py-1.5 bg-emerald-600 hover:bg-emerald-700 active:bg-emerald-800 text-white font-bold rounded-xl text-xs transition-colors shadow-xs flex items-center gap-1.5 cursor-pointer disabled:opacity-50"
+                            >
+                              {isDelivering ? (
+                                <RotateCw className="w-3.5 h-3.5 animate-spin" />
+                              ) : (
+                                <CheckCircle2 className="w-3.5 h-3.5" />
+                              )}
+                              <span>Confirm Delivery & Receipt</span>
+                            </button>
+                          )}
+
+                          {tx.status === 'DELIVERED' && (
+                            <span className="text-emerald-700 font-bold text-xs flex items-center gap-1">
+                              <CheckCircle2 className="w-4 h-4 text-emerald-600" />
+                              <span>Delivered & Inspected</span>
+                            </span>
+                          )}
+                        </div>
+                      </div>
+
+                      <div className="flex flex-col sm:flex-row sm:items-center justify-between text-xs text-slate-700 gap-2">
+                        <div>
+                          <strong>{tx.sourceHospitalName}</strong> → <strong>{tx.destinationHospitalName}</strong>
+                        </div>
+                        <div className="flex items-center gap-3 text-slate-500">
+                          <span>
+                            {tx.componentType} ({tx.bloodGroup}) · {tx.quantity} unit(s)
+                          </span>
+                          <span>·</span>
+                          <span className="font-mono text-indigo-700 font-semibold">
+                            Corridor ETA: ~{tx.transitMinutes}m
+                          </span>
+                        </div>
+                      </div>
+
+                      <p className="text-[11px] text-slate-600 italic">
+                        {tx.clinicalReason}
+                      </p>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+          </div>
+
+          {/* Section 3: Incoming Requests Section: Donor Fulfilment */}
           <div className="bg-white p-6 rounded-2xl border border-slate-200 shadow-2xs space-y-4">
             <div className="flex items-center justify-between">
               <div>
@@ -1601,6 +2489,7 @@ export const HospitalDashboardView: React.FC<HospitalDashboardViewProps> = ({
                 </p>
               </div>
               <button
+                type="button"
                 onClick={fetchIncoming}
                 disabled={isLoadingIncoming}
                 className="p-1.5 rounded-lg bg-slate-50 hover:bg-slate-100 border border-slate-200 text-slate-600 text-xs font-semibold flex items-center gap-1 cursor-pointer"
@@ -1705,46 +2594,58 @@ export const HospitalDashboardView: React.FC<HospitalDashboardViewProps> = ({
             )}
           </div>
 
-          {/* Network Recommendations: Potential Sources for Current Hospital */}
+          {/* Section 4: Audit Trail & Lifecycle Event Log (Part 3) */}
           <div className="bg-white p-6 rounded-2xl border border-slate-200 shadow-2xs space-y-4">
-            <div>
-              <h3 className="text-sm font-bold text-slate-900 flex items-center gap-2">
-                <Sparkles className="w-4 h-4 text-blue-600" />
-                <span>Peer Jaipur Hospital Transfer Corridors & Allocation Recommendations</span>
-              </h3>
-              <p className="text-xs text-slate-500 mt-0.5">
-                Biological compatibility and shortest FEFO transfer times from partner Jaipur hospitals.
-              </p>
+            <div className="flex items-center justify-between">
+              <div>
+                <h3 className="text-sm font-bold text-slate-900 flex items-center gap-2">
+                  <ShieldCheck className="w-4 h-4 text-emerald-600" />
+                  <span>Audit Trail & Event Log</span>
+                </h3>
+                <p className="text-xs text-slate-500 mt-0.5">
+                  Immutable regulatory audit records for every request created, reservation locked, and transfer completed.
+                </p>
+              </div>
             </div>
 
-            <div className="grid grid-cols-1 md:grid-cols-2 gap-3.5">
-              {recommendations.slice(0, 6).map((rec) => (
-                <div
-                  key={rec.unitId}
-                  className="p-4 rounded-xl border border-blue-100 bg-blue-50/30 hover:bg-blue-50/70 transition-all space-y-2"
-                >
-                  <div className="flex items-center justify-between">
-                    <span className="font-bold text-slate-900 text-xs">{rec.sourceHospitalName}</span>
-                    <span className="px-2 py-0.5 rounded font-mono font-bold text-[10px] bg-blue-600 text-white">
-                      Score: {rec.priorityScore}
-                    </span>
+            {transferAuditLogs.length === 0 ? (
+              <div className="p-6 bg-slate-50 rounded-xl border border-dashed border-slate-200 text-center text-xs text-slate-400">
+                No recent transfer lifecycle logs recorded yet.
+              </div>
+            ) : (
+              <div className="space-y-2 max-h-60 overflow-y-auto">
+                {transferAuditLogs.slice(0, 10).map((log, lIdx) => (
+                  <div
+                    key={log.id || lIdx}
+                    className="p-3 bg-slate-50 rounded-xl border border-slate-200 text-xs flex items-start justify-between gap-3"
+                  >
+                    <div className="space-y-0.5">
+                      <div className="flex items-center gap-2">
+                        <span
+                          className={`font-mono font-bold text-[10px] px-2 py-0.5 rounded ${
+                            log.action_type === 'RESERVED'
+                              ? 'bg-amber-100 text-amber-900'
+                              : log.action_type === 'DISPATCHED'
+                              ? 'bg-indigo-100 text-indigo-900'
+                              : log.action_type === 'COMPLETED'
+                              ? 'bg-emerald-100 text-emerald-900'
+                              : 'bg-slate-200 text-slate-800'
+                          }`}
+                        >
+                          {log.action_type || log.actionType}
+                        </span>
+                        <span className="font-mono text-[10px] text-slate-400">
+                          {log.created_at ? new Date(log.created_at).toLocaleTimeString() : new Date().toLocaleTimeString()}
+                        </span>
+                      </div>
+                      <p className="text-slate-700 text-[11px] leading-relaxed">
+                        {log.notes}
+                      </p>
+                    </div>
                   </div>
-
-                  <div className="text-xs text-slate-700 flex items-center justify-between">
-                    <span>
-                      {rec.componentType} · <strong>{rec.bloodGroup}</strong>
-                    </span>
-                    <span className="text-[11px] text-blue-800 font-mono">
-                      Corridor ETA: ~{rec.estimatedTransitMinutes}m
-                    </span>
-                  </div>
-
-                  <p className="text-[11px] text-slate-600 leading-relaxed border-t border-blue-100 pt-1.5">
-                    {rec.reason}
-                  </p>
-                </div>
-              ))}
-            </div>
+                ))}
+              </div>
+            )}
           </div>
         </div>
       )}

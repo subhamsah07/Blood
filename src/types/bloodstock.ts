@@ -126,6 +126,19 @@ export interface ProposedAllocation {
   solverScore?: number;
 }
 
+export interface UnfulfilledRequestDiagnostic {
+  requestId: string;
+  hospitalId: string;
+  componentType: BloodComponentType;
+  bloodGroup: BloodGroup;
+  requestedQuantity: number;
+  allocatedQuantity: number;
+  unmetQuantity: number;
+  urgency: RequestUrgency;
+  primaryBlocker: string;
+  detailedReasons: string[];
+}
+
 export interface AllocationRunSummary {
   runId: string;
   timestamp: string;
@@ -147,6 +160,7 @@ export interface AllocationRunSummary {
   doubleAllocationViolationsCount: number;
   allocations: ProposedAllocation[];
   rejectedCandidates: CandidateEvaluation[];
+  unfulfilledRequests?: UnfulfilledRequestDiagnostic[];
   auditLogs: string[];
 }
 

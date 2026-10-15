@@ -19,18 +19,23 @@ This guide provides step-by-step instructions for connecting your **BloodStock**
 ## 2. Run the SQL Migration
 
 1. In your Supabase Dashboard, open the left sidebar and click on **SQL Editor**.
-2. Click **New query** (or open the migration file located in this project at `supabase/migrations/20261015000000_init_bloodstock_schema.sql`).
-3. Copy the entire contents of `supabase/migrations/20261015000000_init_bloodstock_schema.sql` and paste it into the SQL Editor.
-4. Click **Run** (or press `Ctrl+Enter` / `Cmd+Enter`).
-5. Confirm that the query succeeds with message `Success. No rows returned` or similar.
+2. Run the migration scripts located in `supabase/migrations/` in sequential order:
+   - `20261015000000_init_bloodstock_schema.sql` (Core tables, enums, triggers)
+   - `20261015030000_jaipur_dashboard_schema.sql` (Multi-hospital RBAC, transfer audit log, atomic reservations)
+   - `20261015040000_inventory_quarantine_and_rls.sql` (Quarantine status, inventory verification RPC)
+   - `20261015050000_fix_blood_requests_rls_and_rpc.sql` (Comprehensive RLS policies for blood requests & atomic create_blood_request RPC)
+3. For each script, paste into the SQL Editor and click **Run** (`Ctrl+Enter` / `Cmd+Enter`).
+4. Confirm success message.
 
-This script creates:
+These scripts create:
 - `public.hospitals`: Hospital profile table linked to `auth.users(id)`.
-- `public.blood_units`: Perishable blood component inventory table.
+- `public.hospital_user_access`: Multi-hospital membership and role-based access.
+- `public.blood_units`: Perishable blood component inventory table with quarantine support.
 - `public.blood_requests`: Emergency and routine transfusion request orders table.
-- Row-Level Security (RLS) policies isolating access per hospital.
-- Database trigger `tr_check_hospital_status` preventing hospitals from self-promoting their account status.
-- 3 initial synthetic demonstration hospitals.
+- `public.blood_transfer_audit_log`: Auditable chain of custody.
+- Row-Level Security (RLS) policies isolating access per hospital and across authorized network members.
+- Stored procedures: `atomic_reserve_units`, `release_request_reservations`, `create_blood_request`.
+- Initial synthetic demonstration hospitals.
 
 ---
 

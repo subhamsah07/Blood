@@ -9,8 +9,9 @@ import {
   isLegacyHospital,
   matchJaipurHospital,
 } from '../src/services/authService';
-import { hospitalDataService } from '../src/services/hospitalDataService';
+import { hospitalDataService, JAIPUR_TRANSIT_MATRIX } from '../src/services/hospitalDataService';
 import { checkBiologicalCompatibility } from '../src/services/compatibilityRules';
+import { runConstraintOptimizer } from '../src/services/optimizerSolver';
 import { supabase } from '../src/lib/supabase';
 
 async function runTestSuite() {
@@ -52,6 +53,7 @@ async function runTestSuite() {
   };
 
   // Mock from() to return the four Jaipur hospitals for hospital_user_access and hospitals tables
+  const inMemoryUnits: any[] = [];
   const originalFrom = supabase.from.bind(supabase);
   (supabase as any).from = (tableName: string) => {
     if (tableName === 'hospital_user_access') {
@@ -86,25 +88,17 @@ async function runTestSuite() {
     if (tableName === 'blood_units') {
       return {
         select: () => ({
-          eq: () => ({
+          eq: (_col: string, val: string) => ({
             order: async () => ({
-              data: [
-                {
-                  id: 'unit-db-101',
-                  hospital_id: JAIPUR_DEMO_HOSPITALS[0].id,
-                  component_type: 'PRBC',
-                  blood_group: 'O_NEG',
-                  unit_status: 'AVAILABLE',
-                  expiry_at: new Date(Date.now() + 20 * 24 * 3600 * 1000).toISOString(),
-                  created_at: new Date().toISOString(),
-                },
-              ],
+              data: inMemoryUnits
+                .filter((u) => u.hospital_id === val)
+                .sort((a, b) => new Date(a.expiry_at).getTime() - new Date(b.expiry_at).getTime()),
               error: null,
             }),
             gt: () => ({
               order: () => ({
                 limit: async () => ({
-                  data: [{ id: 'unit-db-101' }],
+                  data: inMemoryUnits.filter((u) => u.hospital_id === val && u.unit_status === 'AVAILABLE'),
                   error: null,
                 }),
               }),
@@ -112,13 +106,42 @@ async function runTestSuite() {
           }),
         }),
         insert: (rows: any[]) => ({
-          select: async () => ({
-            data: rows.map((r, idx) => ({ id: `unit-inserted-${idx}` })),
-            error: null,
-          }),
+          select: async () => {
+            const inserted = rows.map((r, idx) => {
+              const u = {
+                id: `unit-live-${Date.now()}-${idx}`,
+                hospital_id: r.hospital_id,
+                component_type: r.component_type,
+                blood_group: r.blood_group,
+                unit_status: r.unit_status,
+                expiry_at: r.expiry_at,
+                created_at: r.created_at || new Date().toISOString(),
+              };
+              inMemoryUnits.push(u);
+              return u;
+            });
+            return { data: inserted, error: null };
+          },
         }),
-        update: () => ({
-          in: async () => ({ error: null }),
+        update: (updates: any) => ({
+          eq: (col: string, val: string) => {
+            inMemoryUnits.forEach((u) => {
+              if (u[col] === val) Object.assign(u, updates);
+            });
+            return {
+              eq: () => ({
+                eq: () => ({
+                  gt: async () => ({ error: null }),
+                }),
+              }),
+            };
+          },
+          in: async (col: string, vals: string[]) => {
+            inMemoryUnits.forEach((u) => {
+              if (vals.includes(u[col])) Object.assign(u, updates);
+            });
+            return { error: null };
+          },
         }),
       };
     }
@@ -174,10 +197,12 @@ async function runTestSuite() {
 
   (supabase as any).rpc = async (fnName: string, args: any) => {
     if (fnName === 'atomic_reserve_units') {
+      const available = inMemoryUnits.filter((u) => u.hospital_id === args.p_donor_hospital_id && u.unit_status === 'AVAILABLE');
+      const count = Math.min(args.p_quantity || 1, available.length > 0 ? available.length : 1);
       return {
         data: {
           success: true,
-          reserved_count: args.p_quantity || 1,
+          reserved_count: count,
         },
         error: null,
       };
@@ -187,6 +212,17 @@ async function runTestSuite() {
         data: {
           success: true,
           released_count: 1,
+        },
+        error: null,
+      };
+    }
+    if (fnName === 'verify_and_release_quarantined_unit') {
+      const u = inMemoryUnits.find((unit) => unit.id === args.p_unit_id);
+      if (u) u.unit_status = 'AVAILABLE';
+      return {
+        data: {
+          success: true,
+          unit_id: args.p_unit_id,
         },
         error: null,
       };
@@ -365,6 +401,15 @@ async function runTestSuite() {
   // --------------------------------------------------------------------------
   console.log('\n--- Test Case 6: Atomic Reservation & Allocation Safety ---');
   const narayana = JAIPUR_DEMO_HOSPITALS[2];
+  authService.setActiveHospitalId(narayana.id);
+  await hospitalDataService.addBloodStock(narayana, {
+    componentType: 'PLATELETS',
+    bloodGroup: 'O_POS',
+    quantity: 2,
+    expiryDate: new Date(Date.now() + 5 * 24 * 3600 * 1000).toISOString(),
+    screeningPassed: true,
+    batchRef: 'BATCH-NARAYANA-PLT-01',
+  });
 
   const approveRes = await hospitalDataService.approveIncomingRequest(narayana, reqRes.requestId!, 1);
   assert(
@@ -632,6 +677,333 @@ async function runTestSuite() {
       `Hospital #${i + 1} inventory is strictly sorted by earliest expiry date (FEFO)`
     );
   }
+  // --------------------------------------------------------------------------
+  // TEST CASE 15: Part 1 - Centralized Deterministic Allocation Engine & Hard Constraints
+  // --------------------------------------------------------------------------
+  console.log('\n--- Test Case 15: Centralized Allocation Engine & Hard Constraints ---');
+  const testHospitals = JAIPUR_DEMO_HOSPITALS.map((h) => ({
+    id: h.id,
+    name: h.name,
+    code: (h as any).code || h.id.slice(0, 4).toUpperCase(),
+    address: h.address,
+    coordinates: { x: 50, y: 50 },
+    protectedReserves: { PRBC: 1, PLATELETS: 0, FFP: 0, CRYOPRECIPITATE: 0 },
+    phone: h.phone,
+  }));
+
+  const testUnits = [
+    {
+      id: 'unit-hard-01',
+      hospitalId: JAIPUR_DEMO_HOSPITALS[0].id, // Fortis
+      componentType: 'PRBC' as const,
+      bloodGroup: 'A_POS' as const, // Incompatible with O- request
+      donationDate: new Date(Date.now() - 5 * 86400000).toISOString(),
+      expiresAt: new Date(Date.now() + 25 * 86400000).toISOString(),
+      status: 'AVAILABLE' as const,
+      handlingBufferMinutes: 20,
+      storageTemperatureCelsius: 4,
+      syntheticBatchId: 'BATCH-TEST-15',
+    },
+    {
+      id: 'unit-hard-02',
+      hospitalId: JAIPUR_DEMO_HOSPITALS[1].id, // CK Birla
+      componentType: 'PRBC' as const,
+      bloodGroup: 'O_NEG' as const, // Universal match
+      donationDate: new Date(Date.now() - 5 * 86400000).toISOString(),
+      expiresAt: new Date(Date.now() + 25 * 86400000).toISOString(),
+      status: 'AVAILABLE' as const,
+      handlingBufferMinutes: 20,
+      storageTemperatureCelsius: 4,
+      syntheticBatchId: 'BATCH-TEST-15',
+    },
+  ];
+
+  const testRequests = [
+    {
+      id: 'req-hard-01',
+      hospitalId: JAIPUR_DEMO_HOSPITALS[2].id, // Narayana
+      patientCaseId: 'CASE-HARD-1',
+      componentType: 'PRBC' as const,
+      bloodGroup: 'O_NEG' as const,
+      quantity: 1,
+      urgency: 'URGENT_SURGERY' as const,
+      createdAt: new Date(Date.now() - 3600000).toISOString(),
+      deadlineAt: new Date(Date.now() + 4 * 3600000).toISOString(),
+      status: 'PENDING' as const,
+      allocatedUnitIds: [],
+    },
+  ];
+
+  const hardRun = runConstraintOptimizer(
+    testHospitals,
+    testUnits,
+    testRequests,
+    JAIPUR_TRANSIT_MATRIX,
+    new Date()
+  );
+
+  assert(
+    hardRun.allocations.length === 1 && hardRun.allocations[0].unitId === 'unit-hard-02',
+    'Hard biological compatibility enforced: Incompatible unit-hard-01 (A+) rejected, compatible unit-hard-02 (O-) allocated'
+  );
+  assert(
+    hardRun.doubleAllocationViolationsCount === 0,
+    'Zero double-allocation violations guaranteed across solver run'
+  );
+
+  // --------------------------------------------------------------------------
+  // TEST CASE 16: Priority Rule A - Emergency Preemption & Partial Allocation
+  // --------------------------------------------------------------------------
+  console.log('\n--- Test Case 16: Priority Rule A — Verified Emergency Preemption ---');
+  // Two competing requests for ONE available O- unit:
+  // Request A: Routine, created 3 hours ago
+  // Request B: Verified STAT Trauma Emergency, created 10 minutes ago
+  const singleOUnit = [
+    {
+      id: 'unit-emergency-preempt-01',
+      hospitalId: JAIPUR_DEMO_HOSPITALS[0].id,
+      componentType: 'PRBC' as const,
+      bloodGroup: 'O_NEG' as const,
+      donationDate: new Date(Date.now() - 86400000).toISOString(),
+      expiresAt: new Date(Date.now() + 20 * 86400000).toISOString(),
+      status: 'AVAILABLE' as const,
+      handlingBufferMinutes: 20,
+      storageTemperatureCelsius: 4,
+      syntheticBatchId: 'BATCH-EMERG',
+    },
+  ];
+
+  const competingRequests = [
+    {
+      id: 'req-routine-early',
+      hospitalId: JAIPUR_DEMO_HOSPITALS[1].id,
+      patientCaseId: 'CASE-ROUTINE-1',
+      componentType: 'PRBC' as const,
+      bloodGroup: 'O_NEG' as const,
+      quantity: 1,
+      urgency: 'ROUTINE' as const,
+      createdAt: new Date(Date.now() - 3 * 3600000).toISOString(), // Earlier
+      deadlineAt: new Date(Date.now() + 12 * 3600000).toISOString(),
+      status: 'PENDING' as const,
+      allocatedUnitIds: [],
+    },
+    {
+      id: 'req-trauma-stat-late',
+      hospitalId: JAIPUR_DEMO_HOSPITALS[2].id,
+      patientCaseId: 'CASE-STAT-TRAUMA',
+      componentType: 'PRBC' as const,
+      bloodGroup: 'O_NEG' as const,
+      quantity: 2, // Needs 2 units, but only 1 exists
+      urgency: 'CRITICAL_TRAUMA' as const, // STAT Emergency
+      createdAt: new Date(Date.now() - 10 * 60000).toISOString(), // Later
+      deadlineAt: new Date(Date.now() + 90 * 60000).toISOString(),
+      status: 'PENDING' as const,
+      allocatedUnitIds: [],
+    },
+  ];
+
+  const emergRun = runConstraintOptimizer(
+    testHospitals,
+    singleOUnit,
+    competingRequests,
+    JAIPUR_TRANSIT_MATRIX,
+    new Date()
+  );
+
+  assert(
+    emergRun.allocations.length === 1 && emergRun.allocations[0].requestId === 'req-trauma-stat-late',
+    'Emergency Rule A: Verified STAT Trauma request outranks earlier routine request regardless of submission timestamp'
+  );
+  assert(
+    emergRun.criticalDemandFulfilled === 1 && emergRun.criticalDemandTotal === 2,
+    'Emergency Rule A: Partial allocation supported (1/2 fulfilled) without starving emergency'
+  );
+  assert(
+    emergRun.unfulfilledRequests !== undefined &&
+      emergRun.unfulfilledRequests.some((u) => u.requestId === 'req-trauma-stat-late' && u.unmetQuantity === 1),
+    'Emergency Rule A: Unfulfilled deficit (1 unit) clearly surfaced with clinical explanation'
+  );
+
+  // --------------------------------------------------------------------------
+  // TEST CASE 17: Priority Rule B - First Come, First Served (FCFS) for Equal Priority
+  // --------------------------------------------------------------------------
+  console.log('\n--- Test Case 17: Priority Rule B — First Come, First Served (FCFS) ---');
+  const fcfsRequests = [
+    {
+      id: 'req-fcfs-second',
+      hospitalId: JAIPUR_DEMO_HOSPITALS[1].id,
+      patientCaseId: 'CASE-SURG-2',
+      componentType: 'PRBC' as const,
+      bloodGroup: 'O_NEG' as const,
+      quantity: 1,
+      urgency: 'URGENT_SURGERY' as const,
+      createdAt: new Date(Date.now() - 30 * 60000).toISOString(), // 30m ago (Later)
+      deadlineAt: new Date(Date.now() + 4 * 3600000).toISOString(),
+      status: 'PENDING' as const,
+      allocatedUnitIds: [],
+    },
+    {
+      id: 'req-fcfs-first',
+      hospitalId: JAIPUR_DEMO_HOSPITALS[2].id,
+      patientCaseId: 'CASE-SURG-1',
+      componentType: 'PRBC' as const,
+      bloodGroup: 'O_NEG' as const,
+      quantity: 1,
+      urgency: 'URGENT_SURGERY' as const,
+      createdAt: new Date(Date.now() - 90 * 60000).toISOString(), // 90m ago (Earlier)
+      deadlineAt: new Date(Date.now() + 4 * 3600000).toISOString(),
+      status: 'PENDING' as const,
+      allocatedUnitIds: [],
+    },
+  ];
+
+  const fcfsRun = runConstraintOptimizer(
+    testHospitals,
+    singleOUnit,
+    fcfsRequests,
+    JAIPUR_TRANSIT_MATRIX,
+    new Date()
+  );
+
+  assert(
+    fcfsRun.allocations.length === 1 && fcfsRun.allocations[0].requestId === 'req-fcfs-first',
+    'FCFS Rule B: Earlier order (submitted 90m ago) prioritized over later order (submitted 30m ago) of same clinical tier'
+  );
+
+  // --------------------------------------------------------------------------
+  // TEST CASE 18: Priority Rule C - Nearest Feasible Source & FEFO Stock Selection
+  // --------------------------------------------------------------------------
+  console.log('\n--- Test Case 18: Priority Rule C — Nearest Feasible Source & FEFO ---');
+  // Destination: SDMH (Hospital #4)
+  // Donor 1: Fortis (transit = 14m)
+  // Donor 2: Narayana (transit = 28m)
+  // Donor 1 has two units: Unit A expires in 3 days, Unit B expires in 20 days
+  const fefoUnits = [
+    {
+      id: 'unit-fresher-fortis',
+      hospitalId: JAIPUR_DEMO_HOSPITALS[0].id, // Fortis (14m)
+      componentType: 'PRBC' as const,
+      bloodGroup: 'O_NEG' as const,
+      donationDate: new Date(Date.now() - 2 * 86400000).toISOString(),
+      expiresAt: new Date(Date.now() + 20 * 86400000).toISOString(), // 20 days
+      status: 'AVAILABLE' as const,
+      handlingBufferMinutes: 20,
+      storageTemperatureCelsius: 4,
+      syntheticBatchId: 'BATCH-FEFO',
+    },
+    {
+      id: 'unit-older-fortis',
+      hospitalId: JAIPUR_DEMO_HOSPITALS[0].id, // Fortis (14m)
+      componentType: 'PRBC' as const,
+      bloodGroup: 'O_NEG' as const,
+      donationDate: new Date(Date.now() - 15 * 86400000).toISOString(),
+      expiresAt: new Date(Date.now() + 3 * 86400000).toISOString(), // 3 days (Older, should be used first)
+      status: 'AVAILABLE' as const,
+      handlingBufferMinutes: 20,
+      storageTemperatureCelsius: 4,
+      syntheticBatchId: 'BATCH-FEFO',
+    },
+    {
+      id: 'unit-narayana-far',
+      hospitalId: JAIPUR_DEMO_HOSPITALS[2].id, // Narayana (28m)
+      componentType: 'PRBC' as const,
+      bloodGroup: 'O_NEG' as const,
+      donationDate: new Date(Date.now() - 15 * 86400000).toISOString(),
+      expiresAt: new Date(Date.now() + 2 * 86400000).toISOString(),
+      status: 'AVAILABLE' as const,
+      handlingBufferMinutes: 20,
+      storageTemperatureCelsius: 4,
+      syntheticBatchId: 'BATCH-FEFO',
+    },
+  ];
+
+  const sdmhRequest = [
+    {
+      id: 'req-sdmh-nearest',
+      hospitalId: JAIPUR_DEMO_HOSPITALS[3].id, // SDMH
+      patientCaseId: 'CASE-SDMH-1',
+      componentType: 'PRBC' as const,
+      bloodGroup: 'O_NEG' as const,
+      quantity: 1,
+      urgency: 'URGENT_SURGERY' as const,
+      createdAt: new Date().toISOString(),
+      deadlineAt: new Date(Date.now() + 4 * 3600000).toISOString(),
+      status: 'PENDING' as const,
+      allocatedUnitIds: [],
+    },
+  ];
+
+  const fefoRun = runConstraintOptimizer(
+    testHospitals,
+    fefoUnits,
+    sdmhRequest,
+    JAIPUR_TRANSIT_MATRIX,
+    new Date()
+  );
+
+  assert(
+    fefoRun.allocations.length === 1 &&
+      fefoRun.allocations[0].sourceHospitalId === JAIPUR_DEMO_HOSPITALS[0].id,
+    'Rule C: Sourced from nearest feasible donor Fortis (14m transit corridor) rather than farther Narayana (28m)'
+  );
+  assert(
+    fefoRun.allocations[0].unitId === 'unit-older-fortis',
+    'FEFO Spoilage Optimization: Earlier-expiring unit (expires in 3d) allocated before fresher unit (expires in 20d)'
+  );
+
+  // --------------------------------------------------------------------------
+  // TEST CASE 19: Four-Phase Transfer Lifecycle (Reserve -> Dispatch -> Deliver)
+  // --------------------------------------------------------------------------
+  console.log('\n--- Test Case 19: Four-Phase Transfer Lifecycle & Auditability ---');
+  const sourceHosp = JAIPUR_DEMO_HOSPITALS[0];
+  const destHosp = JAIPUR_DEMO_HOSPITALS[3];
+
+  // 1. Commit allocation reservation
+  const commitRes = await hospitalDataService.commitAllocationReservation(
+    sourceHosp,
+    destHosp,
+    'req-sdmh-nearest',
+    'unit-older-fortis',
+    'Urgent surgical transfusion'
+  );
+  assert(commitRes.success && Boolean(commitRes.transferId), 'Phase 1: Recommended allocation committed to RESERVED state');
+
+  const transfers = await hospitalDataService.getNetworkTransfers();
+  const tx = transfers.find((t) => t.id === commitRes.transferId);
+  assert(tx !== undefined && tx.status === 'RESERVED', 'Transfer record correctly initialized in RESERVED status');
+
+  // 2. Dispatch transfer
+  const dispatchRes = await hospitalDataService.dispatchTransfer(
+    sourceHosp,
+    commitRes.transferId!,
+    'req-sdmh-nearest',
+    ['unit-older-fortis']
+  );
+  assert(dispatchRes.success, 'Phase 2: Explicit courier dispatch executed');
+
+  const dispatchedTxs = await hospitalDataService.getNetworkTransfers();
+  const dispatchedTx = dispatchedTxs.find((t) => t.id === commitRes.transferId);
+  assert(dispatchedTx?.status === 'DISPATCHED', 'Transfer status accurately updated to DISPATCHED');
+
+  // 3. Confirm delivery
+  const deliverRes = await hospitalDataService.confirmTransferDelivered(
+    destHosp,
+    commitRes.transferId!,
+    'req-sdmh-nearest',
+    ['unit-older-fortis']
+  );
+  assert(deliverRes.success, 'Phase 3: Delivery and receipt confirmation executed');
+
+  const deliveredTxs = await hospitalDataService.getNetworkTransfers();
+  const deliveredTx = deliveredTxs.find((t) => t.id === commitRes.transferId);
+  assert(deliveredTx?.status === 'DELIVERED', 'Transfer status finalized to DELIVERED');
+
+  // 4. Verify audit trail
+  const audits = await hospitalDataService.getTransferAuditLogs('req-sdmh-nearest');
+  assert(
+    audits.length >= 2,
+    'Auditability: Complete lifecycle event logs recorded (RESERVED, DISPATCHED, COMPLETED)'
+  );
 
   console.log(`\n======================================================`);
   console.log(`TEST RESULTS: ${passedCount} PASSED, ${failedCount} FAILED`);

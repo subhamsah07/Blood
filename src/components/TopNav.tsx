@@ -10,6 +10,8 @@ interface TopNavProps {
   profile: HospitalProfile | null;
   userHospitals?: HospitalProfile[];
   onSelectHospital?: (hospital: HospitalProfile) => void;
+  currentView?: 'public' | 'hospital_dashboard' | 'allocation_studio';
+  onSelectView?: (view: 'public' | 'hospital_dashboard' | 'allocation_studio') => void;
 }
 
 export const TopNav: React.FC<TopNavProps> = ({
@@ -19,12 +21,17 @@ export const TopNav: React.FC<TopNavProps> = ({
   profile,
   userHospitals = [],
   onSelectHospital,
+  currentView = 'public',
+  onSelectView,
 }) => {
   return (
     <header className="bg-white/95 backdrop-blur-md border-b border-blue-100 sticky top-0 z-50 px-4 sm:px-6 py-3 shadow-xs">
       <div className="max-w-7xl mx-auto flex items-center justify-between gap-3">
         {/* Brand Logo */}
-        <div className="flex items-center gap-2.5 shrink-0">
+        <div
+          onClick={() => onSelectView && onSelectView('public')}
+          className="flex items-center gap-2.5 shrink-0 cursor-pointer"
+        >
           <div className="w-9 h-9 rounded-xl bg-gradient-to-br from-red-600 to-blue-700 flex items-center justify-center text-white shadow-sm">
             <Droplet className="w-5 h-5 fill-white" />
           </div>
@@ -37,6 +44,48 @@ export const TopNav: React.FC<TopNavProps> = ({
             </span>
           </div>
         </div>
+
+        {/* Center View Switcher */}
+        {onSelectView && (
+          <div className="hidden md:flex items-center p-1 bg-slate-100 rounded-xl text-xs font-semibold border border-slate-200">
+            <button
+              onClick={() => onSelectView('public')}
+              className={`px-3 py-1.5 rounded-lg transition-all cursor-pointer ${
+                currentView === 'public'
+                  ? 'bg-white text-blue-700 font-bold shadow-xs'
+                  : 'text-slate-600 hover:text-slate-900'
+              }`}
+            >
+              Public Home
+            </button>
+            <button
+              onClick={() => {
+                if (profile) {
+                  onSelectView('hospital_dashboard');
+                } else {
+                  onOpenLogin();
+                }
+              }}
+              className={`px-3 py-1.5 rounded-lg transition-all cursor-pointer ${
+                currentView === 'hospital_dashboard'
+                  ? 'bg-white text-blue-700 font-bold shadow-xs'
+                  : 'text-slate-600 hover:text-slate-900'
+              }`}
+            >
+              Hospital Dashboard
+            </button>
+            <button
+              onClick={() => onSelectView('allocation_studio')}
+              className={`px-3 py-1.5 rounded-lg transition-all cursor-pointer ${
+                currentView === 'allocation_studio'
+                  ? 'bg-white text-blue-700 font-bold shadow-xs'
+                  : 'text-slate-600 hover:text-slate-900'
+              }`}
+            >
+              Centralized Allocation Studio
+            </button>
+          </div>
+        )}
 
         {/* Task Bar Options: Contact Us and Hospital Switcher / Logout */}
         <div className="flex items-center gap-2 sm:gap-3">
