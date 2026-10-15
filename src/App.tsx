@@ -5,17 +5,17 @@ import {
   BloodRequest,
   Transfer,
   TravelTimeMatrix,
-  AllocationRunSummary,
-  ProposedAllocation,
-  ScenarioEvent,
-  UserRole,
 } from './types/bloodstock';
 import { apiClient } from './services/apiClient';
+import { authService, HospitalProfile } from './services/authService';
+import { hospitalDataService, NetworkRecommendation } from './services/hospitalDataService';
 import { MedicalDisclaimer } from './components/MedicalDisclaimer';
 import { TopNav } from './components/TopNav';
 import { MainDashboard } from './components/MainDashboard';
+import { HospitalDashboardView } from './components/HospitalDashboardView';
+import { HospitalLoginPage } from './components/HospitalLoginPage';
+import { HospitalSelector } from './components/HospitalSelector';
 import { NewRequestModal } from './components/NewRequestModal';
-import { HospitalLoginModal } from './components/HospitalLoginModal';
 import { HospitalListModal } from './components/HospitalListModal';
 import { ContactUsModal } from './components/ContactUsModal';
 
@@ -26,20 +26,23 @@ export default function App() {
   const [transfers, setTransfers] = useState<Transfer[]>([]);
   const [travelMatrix, setTravelMatrix] = useState<TravelTimeMatrix>({});
   const [simulationTime, setSimulationTime] = useState<string>(new Date('2026-10-15T09:00:00Z').toISOString());
-  const [activeScenario, setActiveScenario] = useState<ScenarioEvent | null>(null);
-  const [lastBaselineRun, setLastBaselineRun] = useState<AllocationRunSummary | null>(null);
-  const [lastOptimizerRun, setLastOptimizerRun] = useState<AllocationRunSummary | null>(null);
-  const [auditHistory, setAuditHistory] = useState<string[]>([]);
+
+  // Supabase Authentication & Multi-Hospital Profile State
+  const [authenticatedProfile, setAuthenticatedProfile] = useState<HospitalProfile | null>(null);
+  const [userHospitals, setUserHospitals] = useState<HospitalProfile[]>([]);
+  const [activeHospitalUnits, setActiveHospitalUnits] = useState<BloodUnit[]>([]);
+  const [activeHospitalRequests, setActiveHospitalRequests] = useState<BloodRequest[]>([]);
+  const [activeRecommendations, setActiveRecommendations] = useState<NetworkRecommendation[]>([]);
+  const [isRefreshingHospitalData, setIsRefreshingHospitalData] = useState<boolean>(false);
+  const [currentView, setCurrentView] = useState<'public' | 'hospital_dashboard'>('public');
 
   // Modals
-  const [isNewRequestOpen, setIsNewRequestOpen] = useState<boolean>(false);
   const [isLoginModalOpen, setIsLoginModalOpen] = useState<boolean>(false);
+  const [isNewRequestOpen, setIsNewRequestOpen] = useState<boolean>(false);
   const [isHospitalListOpen, setIsHospitalListOpen] = useState<boolean>(false);
   const [isContactUsOpen, setIsContactUsOpen] = useState<boolean>(false);
-  const [loggedInHospitalId, setLoggedInHospitalId] = useState<string | null>(null);
-  const [loggedInRole, setLoggedInRole] = useState<string | null>(null);
 
-  // Load state
+  // Load initial application data
   const refreshState = useCallback(async () => {
     try {
       const [hospData, unitData, reqData, txData, matrixData, sysState] = await Promise.all([
@@ -57,68 +60,228 @@ export default function App() {
       setTransfers(txData);
       setTravelMatrix(matrixData);
       setSimulationTime(sysState.simulationTime);
-      setActiveScenario(sysState.activeScenario);
-      setLastBaselineRun(sysState.lastBaselineRun);
-      setLastOptimizerRun(sysState.lastOptimizerRun);
-      setAuditHistory(sysState.auditHistory);
     } catch (err) {
       console.error('Error refreshing state:', err);
     }
   }, []);
 
+  // Request sequence ref to cancel/ignore outdated asynchronous responses
+  const dataRequestSeqRef = React.useRef<number>(0);
+  const userHospitalsRef = React.useRef<HospitalProfile[]>(userHospitals);
+  useEffect(() => {
+    userHospitalsRef.current = userHospitals;
+  }, [userHospitals]);
+
+  // Fetch data specifically scoped to the active hospital context
+  const refreshHospitalScopedData = useCallback(async (hosp: HospitalProfile, availableHospitals?: HospitalProfile[]) => {
+    // Clear stale hospital-specific cached data immediately when active hospital changes
+    setActiveHospitalUnits([]);
+    setActiveHospitalRequests([]);
+    setActiveRecommendations([]);
+    setIsRefreshingHospitalData(true);
+
+    const currentSeq = ++dataRequestSeqRef.current;
+
+    try {
+      const allList = availableHospitals && availableHospitals.length > 0 ? availableHospitals : userHospitalsRef.current;
+      const [localUnits, localReqs, localRecs] = await Promise.all([
+        hospitalDataService.getHospitalInventory(hosp),
+        hospitalDataService.getHospitalRequests(hosp),
+        hospitalDataService.getNetworkRecommendations(hosp, allList),
+      ]);
+
+      // Cancel or ignore outdated asynchronous responses so previous hospital data cannot overwrite dashboard
+      if (currentSeq !== dataRequestSeqRef.current) {
+        return;
+      }
+
+      setActiveHospitalUnits(localUnits);
+      setActiveHospitalRequests(localReqs);
+      setActiveRecommendations(localRecs);
+    } catch (err) {
+      console.error('[App] Failed to refresh hospital scoped data:', err);
+    } finally {
+      if (currentSeq === dataRequestSeqRef.current) {
+        setIsRefreshingHospitalData(false);
+      }
+    }
+  }, []);
+
+  const isInitialSessionCheckedRef = React.useRef<boolean>(false);
+
+  // Check Supabase session on startup (strictly once on mount)
   useEffect(() => {
     refreshState();
-  }, [refreshState]);
+
+    if (!isInitialSessionCheckedRef.current) {
+      isInitialSessionCheckedRef.current = true;
+      const checkSession = async () => {
+        try {
+          const { profile, userHospitals: sessionHospitals } = await authService.getSession();
+          if (profile && profile.account_status === 'active') {
+            setAuthenticatedProfile(profile);
+            setUserHospitals(sessionHospitals);
+            setCurrentView('hospital_dashboard');
+            await refreshHospitalScopedData(profile, sessionHospitals);
+          }
+        } catch (e) {
+          console.error('Session check failed:', e);
+        }
+      };
+      checkSession();
+    }
+  }, [refreshState, refreshHospitalScopedData]);
+
+  // Handle Switching Active Hospital Context
+  const handleSwitchHospital = async (targetHospital: HospitalProfile) => {
+    // Rule 2 & 3: Verify target hospital is authorized
+    const isAuthorized = userHospitals.some((h) => h.id === targetHospital.id);
+    if (!isAuthorized) {
+      console.warn('[App] Blocked switch: hospital is not in authorized memberships:', targetHospital.name);
+      return;
+    }
+
+    authService.setActiveHospitalId(targetHospital.id);
+    setAuthenticatedProfile(targetHospital);
+    await refreshHospitalScopedData(targetHospital, userHospitals);
+  };
+
+  // Handle Logout
+  const handleLogout = async () => {
+    await authService.signOut();
+    setAuthenticatedProfile(null);
+    setUserHospitals([]);
+    setActiveHospitalUnits([]);
+    setActiveHospitalRequests([]);
+    setActiveRecommendations([]);
+    setCurrentView('public');
+  };
+
+  // Handle Login Success
+  const handleLoginSuccess = async (profile: HospitalProfile, hospitalsList: HospitalProfile[]) => {
+    // Rule 3: Set active hospital only after authorization succeeds
+    authService.setActiveHospitalId(profile.id);
+    setAuthenticatedProfile(profile);
+    setUserHospitals(hospitalsList);
+    setIsLoginModalOpen(false);
+    setCurrentView('hospital_dashboard');
+    await refreshHospitalScopedData(profile, hospitalsList);
+  };
 
   const handleCreateRequest = async (reqData: Omit<BloodRequest, 'id' | 'createdAt' | 'status' | 'allocatedUnitIds'>) => {
     try {
       await apiClient.createRequest(reqData);
       await refreshState();
+      if (authenticatedProfile) {
+        await refreshHospitalScopedData(authenticatedProfile, userHospitals);
+      }
     } catch (err) {
       console.error(err);
     }
   };
 
-  const handleLoginSuccess = (hospitalId: string, roleName: string) => {
-    setLoggedInHospitalId(hospitalId);
-    setLoggedInRole(roleName);
-  };
-
-  const loggedInHospital = hospitals.find((h) => h.id === loggedInHospitalId);
-
   const scrollToContact = () => {
-    const el = document.getElementById('contact-us');
-    if (el) {
-      el.scrollIntoView({ behavior: 'smooth' });
+    if (currentView !== 'public') {
+      setCurrentView('public');
+      setTimeout(() => {
+        document.getElementById('contact-us')?.scrollIntoView({ behavior: 'smooth' });
+      }, 100);
     } else {
-      setIsContactUsOpen(true);
+      document.getElementById('contact-us')?.scrollIntoView({ behavior: 'smooth' });
     }
   };
 
   return (
     <div className="min-h-screen bg-slate-50 flex flex-col font-sans text-slate-900 selection:bg-blue-100 selection:text-blue-900">
-      {/* 1. Scientific & Clinical Disclaimer */}
+      {/* 1. Mandatory Scientific & Clinical Disclaimer */}
       <MedicalDisclaimer />
 
-      {/* 2. Task Bar (Navbar): Logo, Login, and Contact Us ONLY as requested */}
+      {/* 2. Top Navigation Bar with Hospital Switcher */}
       <TopNav
         onOpenLogin={() => setIsLoginModalOpen(true)}
         onOpenContactUs={scrollToContact}
-        loggedInHospitalName={loggedInHospital ? loggedInHospital.code : null}
+        onLogout={handleLogout}
+        profile={authenticatedProfile}
+        userHospitals={userHospitals}
+        onSelectHospital={handleSwitchHospital}
       />
 
-      {/* 3. Main Dashboard Body */}
-      <main className="flex-1 max-w-7xl w-full mx-auto p-4 sm:p-6 md:p-8 space-y-12">
-        <MainDashboard
-          hospitals={hospitals}
-          units={units}
-          requests={requests}
-          onOpenLogin={() => setIsLoginModalOpen(true)}
-          onOpenHospitalList={() => setIsHospitalListOpen(true)}
-          onOpenContactUs={scrollToContact}
-          onOpenEmergencyRequest={() => setIsNewRequestOpen(true)}
-          simulationTime={simulationTime}
-        />
+      {/* 3. Main Stage Content */}
+      <main className="flex-1 max-w-7xl w-full mx-auto p-4 sm:p-6 md:p-8 space-y-8">
+        {/* If user is logged in, show switcher banner */}
+        {authenticatedProfile && (
+          <div className="bg-white p-3.5 rounded-xl border border-blue-200 shadow-xs flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3 text-xs">
+            <div className="flex items-center gap-3 flex-wrap">
+              <div className="flex items-center gap-2">
+                <span className="w-2.5 h-2.5 rounded-full bg-emerald-500 animate-pulse shrink-0" />
+                <span className="text-slate-600 font-medium">
+                  Active Facility Context:
+                </span>
+              </div>
+              {userHospitals.length > 1 ? (
+                <HospitalSelector
+                  userHospitals={userHospitals}
+                  activeHospital={authenticatedProfile}
+                  onSelectHospital={handleSwitchHospital}
+                  isLoading={isRefreshingHospitalData}
+                  isCompact={true}
+                />
+              ) : (
+                <strong className="text-slate-900">{authenticatedProfile.name}</strong>
+              )}
+            </div>
+
+            <div className="flex items-center gap-2 shrink-0">
+              <button
+                onClick={() => setCurrentView('public')}
+                className={`px-3 py-1.5 rounded-lg font-semibold transition-colors cursor-pointer ${
+                  currentView === 'public'
+                    ? 'bg-blue-600 text-white'
+                    : 'bg-slate-100 text-slate-700 hover:bg-slate-200'
+                }`}
+              >
+                Public Home
+              </button>
+              <button
+                onClick={() => setCurrentView('hospital_dashboard')}
+                className={`px-3 py-1.5 rounded-lg font-semibold transition-colors cursor-pointer ${
+                  currentView === 'hospital_dashboard'
+                    ? 'bg-blue-600 text-white'
+                    : 'bg-slate-100 text-slate-700 hover:bg-slate-200'
+                }`}
+              >
+                Hospital Dashboard
+              </button>
+            </div>
+          </div>
+        )}
+
+        {/* View Routing */}
+        {currentView === 'hospital_dashboard' && authenticatedProfile ? (
+          <HospitalDashboardView
+            profile={authenticatedProfile}
+            userHospitals={userHospitals}
+            onSelectHospital={handleSwitchHospital}
+            units={activeHospitalUnits}
+            requests={activeHospitalRequests}
+            recommendations={activeRecommendations}
+            isRefreshing={isRefreshingHospitalData}
+            onRefreshData={() => refreshHospitalScopedData(authenticatedProfile, userHospitals)}
+            onLogout={handleLogout}
+            onOpenEmergencyRequest={() => setIsNewRequestOpen(true)}
+          />
+        ) : (
+          <MainDashboard
+            hospitals={hospitals}
+            units={units}
+            requests={requests}
+            onOpenLogin={() => setIsLoginModalOpen(true)}
+            onOpenHospitalList={() => setIsHospitalListOpen(true)}
+            onOpenContactUs={scrollToContact}
+            onOpenEmergencyRequest={() => setIsNewRequestOpen(true)}
+            simulationTime={simulationTime}
+          />
+        )}
       </main>
 
       {/* 4. Footer */}
@@ -147,23 +310,26 @@ export default function App() {
         </div>
       </footer>
 
-      {/* Modals */}
-      <HospitalLoginModal
-        isOpen={isLoginModalOpen}
-        onClose={() => setIsLoginModalOpen(false)}
-        hospitals={hospitals}
-        onLoginSuccess={handleLoginSuccess}
-      />
+      {/* 5. Modals */}
+      {isLoginModalOpen && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/50 backdrop-blur-xs p-4">
+          <HospitalLoginPage
+            onLoginSuccess={handleLoginSuccess}
+            onCancel={() => setIsLoginModalOpen(false)}
+            isModal={true}
+          />
+        </div>
+      )}
 
       <HospitalListModal
         isOpen={isHospitalListOpen}
         onClose={() => setIsHospitalListOpen(false)}
         hospitals={hospitals}
         units={units}
-        onSelectHospital={(hospId) => {
-          setLoggedInHospitalId(hospId);
+        onSelectHospital={() => {
+          setIsLoginModalOpen(true);
         }}
-        onRequestFromHospital={(hospId) => {
+        onRequestFromHospital={() => {
           setIsNewRequestOpen(true);
         }}
       />
