@@ -73,20 +73,55 @@ export const HospitalDashboardView: React.FC<HospitalDashboardViewProps> = ({
 }) => {
   const [activeTab, setActiveTab] = useState<DashboardTab>('OVERVIEW');
 
-  // Inventory Filters
+  // Inventory Filters & Sorting
   const [componentFilter, setComponentFilter] = useState<string>('ALL');
   const [groupFilter, setGroupFilter] = useState<string>('ALL');
   const [statusFilter, setStatusFilter] = useState<string>('ALL');
+  const [sortBy, setSortBy] = useState<'FEFO_ASC' | 'FEFO_DESC' | 'GROUP' | 'COMPONENT' | 'DONATION'>('FEFO_ASC');
 
   // Add Stock Form State
   const [newStockComponent, setNewStockComponent] = useState<BloodComponentType>('PRBC');
   const [newStockGroup, setNewStockGroup] = useState<BloodGroup>('O_NEG');
   const [newStockQuantity, setNewStockQuantity] = useState<number>(2);
   const [newStockExpiryDays, setNewStockExpiryDays] = useState<number>(35);
+  const [newStockDonationDate, setNewStockDonationDate] = useState<string>(
+    new Date().toISOString().split('T')[0]
+  );
+  const [newStockInitialStatus, setNewStockInitialStatus] = useState<'QUARANTINED' | 'AVAILABLE'>('QUARANTINED');
   const [newStockBatchRef, setNewStockBatchRef] = useState<string>('');
-  const [newStockScreened, setNewStockScreened] = useState<boolean>(true);
+  const [newStockScreened, setNewStockScreened] = useState<boolean>(false);
   const [isSubmittingStock, setIsSubmittingStock] = useState<boolean>(false);
+  const isSubmittingStockRef = React.useRef<boolean>(false);
   const [stockFeedback, setStockFeedback] = useState<{ type: 'success' | 'error'; message: string } | null>(null);
+
+  // Quarantine release state
+  const [isReleasingUnitId, setIsReleasingUnitId] = useState<string | null>(null);
+
+  // Discard Modal & Reason State
+  const [discardTargetUnit, setDiscardTargetUnit] = useState<BloodUnit | null>(null);
+  const [discardReasonCategory, setDiscardReasonCategory] = useState<string>('QC Screening Failed (TTI Positive)');
+  const [discardNote, setDiscardNote] = useState<string>('');
+  const [isDiscardingUnit, setIsDiscardingUnit] = useState<boolean>(false);
+
+  // Reset form feedback and filters when hospital context switches
+  useEffect(() => {
+    setStockFeedback(null);
+    setActionFeedback(null);
+    setRequestFeedback(null);
+    setDiscardTargetUnit(null);
+  }, [profile.id]);
+
+  // Adjust suggested shelf life when component type changes
+  const handleComponentChange = (comp: BloodComponentType) => {
+    setNewStockComponent(comp);
+    if (comp === 'PLATELETS') {
+      setNewStockExpiryDays(5);
+    } else if (comp === 'PRBC') {
+      setNewStockExpiryDays(35);
+    } else if (comp === 'FFP' || comp === 'CRYOPRECIPITATE') {
+      setNewStockExpiryDays(365);
+    }
+  };
 
   // Blood Request Form State
   const [reqComponent, setReqComponent] = useState<BloodComponentType>('PRBC');
@@ -121,14 +156,27 @@ export const HospitalDashboardView: React.FC<HospitalDashboardViewProps> = ({
     fetchIncoming();
   }, [profile.id, userHospitals]);
 
-  // Derived stock statistics
+  // Deduplicate inventory by unique unit ID to ensure each record is displayed strictly once
+  const uniqueUnits = useMemo(() => {
+    const seen = new Set<string>();
+    const result: BloodUnit[] = [];
+    for (const u of units) {
+      if (!u.id || seen.has(u.id)) continue;
+      seen.add(u.id);
+      result.push(u);
+    }
+    return result;
+  }, [units]);
+
+  // Derived stock statistics: Never count quarantined, discarded or expired stock as usable inventory
   const now = Date.now();
-  const usableUnits = units.filter(
+  const quarantinedUnits = uniqueUnits.filter((u) => u.status === 'QUARANTINED');
+  const usableUnits = uniqueUnits.filter(
     (u) => u.status === 'AVAILABLE' && new Date(u.expiresAt).getTime() > now
   );
-  const reservedUnits = units.filter((u) => u.status === 'RESERVED' || u.status === 'IN_TRANSIT');
-  const expiredUnits = units.filter(
-    (u) => new Date(u.expiresAt).getTime() <= now || u.status === 'DISCARDED'
+  const reservedUnits = uniqueUnits.filter((u) => u.status === 'RESERVED' || u.status === 'IN_TRANSIT');
+  const expiredUnits = uniqueUnits.filter(
+    (u) => new Date(u.expiresAt).getTime() <= now || u.status === 'EXPIRED' || u.status === 'DISCARDED'
   );
 
   // Critical near-expiry units (< 48 hours remaining)
@@ -154,45 +202,137 @@ export const HospitalDashboardView: React.FC<HospitalDashboardViewProps> = ({
     return matrix;
   }, [usableUnits]);
 
-  // Filtered inventory list
+  // Filtered & sorted inventory list
   const filteredUnits = useMemo(() => {
-    return units
+    return uniqueUnits
       .filter((u) => {
         if (componentFilter !== 'ALL' && u.componentType !== componentFilter) return false;
         if (groupFilter !== 'ALL' && u.bloodGroup !== groupFilter) return false;
         if (statusFilter !== 'ALL' && u.status !== statusFilter) return false;
         return true;
       })
-      .sort((a, b) => new Date(a.expiresAt).getTime() - new Date(b.expiresAt).getTime());
-  }, [units, componentFilter, groupFilter, statusFilter]);
+      .sort((a, b) => {
+        if (sortBy === 'FEFO_ASC') {
+          return new Date(a.expiresAt).getTime() - new Date(b.expiresAt).getTime();
+        }
+        if (sortBy === 'FEFO_DESC') {
+          return new Date(b.expiresAt).getTime() - new Date(a.expiresAt).getTime();
+        }
+        if (sortBy === 'GROUP') {
+          return a.bloodGroup.localeCompare(b.bloodGroup);
+        }
+        if (sortBy === 'COMPONENT') {
+          return a.componentType.localeCompare(b.componentType);
+        }
+        if (sortBy === 'DONATION') {
+          return new Date(b.donationDate || 0).getTime() - new Date(a.donationDate || 0).getTime();
+        }
+        return 0;
+      });
+  }, [uniqueUnits, componentFilter, groupFilter, statusFilter, sortBy]);
 
   // Requests breakdown
   const pendingRequests = requests.filter((r) => r.status === 'PENDING' || r.status === 'PARTIALLY_ALLOCATED');
   const fulfilledRequests = requests.filter((r) => r.status === 'FULFILLED');
 
-  // Handle Add Stock submission
+  // Handle Quarantine Release
+  const handleReleaseQuarantine = async (unit: BloodUnit) => {
+    setIsReleasingUnitId(unit.id);
+    setActionFeedback(null);
+    try {
+      const res = await hospitalDataService.verifyAndReleaseQuarantine(profile, unit.id, unit.syntheticBatchId);
+      if (res.success) {
+        setActionFeedback({
+          type: 'success',
+          message: `Unit ${unit.syntheticBatchId || unit.id.slice(0, 8)} (${unit.componentType} ${SHORT_BLOOD_GROUPS[unit.bloodGroup]}) successfully cleared QC and released to AVAILABLE usable stock.`,
+        });
+        await onRefreshData();
+      } else {
+        setActionFeedback({ type: 'error', message: res.error || 'Failed to release unit from quarantine.' });
+      }
+    } catch (err: any) {
+      setActionFeedback({ type: 'error', message: err.message || 'Error releasing unit.' });
+    } finally {
+      setIsReleasingUnitId(null);
+    }
+  };
+
+  // Open Discard Confirmation Modal
+  const openDiscardModal = (unit: BloodUnit) => {
+    setDiscardTargetUnit(unit);
+    setDiscardReasonCategory(
+      unit.status === 'QUARANTINED'
+        ? 'QC Screening Failed (TTI Positive)'
+        : unit.status === 'EXPIRED'
+        ? 'Expired / Stability Exceeded'
+        : 'Quality Control Defect'
+    );
+    setDiscardNote('');
+  };
+
+  // Execute Confirmed Discard with Required Reason
+  const handleConfirmDiscard = async () => {
+    if (!discardTargetUnit) return;
+    setIsDiscardingUnit(true);
+    setActionFeedback(null);
+    try {
+      const finalReason = discardNote.trim()
+        ? `${discardReasonCategory} — ${discardNote.trim()}`
+        : discardReasonCategory;
+
+      const res = await hospitalDataService.discardUnit(profile, discardTargetUnit.id, finalReason);
+      if (res.success) {
+        setActionFeedback({
+          type: 'success',
+          message: `Unit ${discardTargetUnit.syntheticBatchId || discardTargetUnit.id.slice(0, 8)} (${discardTargetUnit.componentType}) marked as DISCARDED. Reason: ${finalReason}`,
+        });
+        setDiscardTargetUnit(null);
+        await onRefreshData();
+      } else {
+        setActionFeedback({ type: 'error', message: res.error || 'Failed to discard unit.' });
+      }
+    } catch (err: any) {
+      setActionFeedback({ type: 'error', message: err.message || 'Error discarding unit.' });
+    } finally {
+      setIsDiscardingUnit(false);
+    }
+  };
+
+  // Handle Add Stock submission with strict deduplication guard
   const handleAddStockSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
-    setStockFeedback(null);
+    if (isSubmittingStockRef.current || isSubmittingStock) {
+      return;
+    }
+    isSubmittingStockRef.current = true;
     setIsSubmittingStock(true);
+    setStockFeedback(null);
 
     try {
       const expiryDate = new Date(Date.now() + newStockExpiryDays * 24 * 3600 * 1000).toISOString();
+      const donationIso = newStockDonationDate
+        ? new Date(newStockDonationDate).toISOString()
+        : new Date().toISOString();
+
       const res = await hospitalDataService.addBloodStock(profile, {
         componentType: newStockComponent,
         bloodGroup: newStockGroup,
         quantity: Number(newStockQuantity),
         expiryDate,
+        donationDate: donationIso,
         batchRef: newStockBatchRef.trim() || undefined,
         screeningPassed: newStockScreened,
+        initialStatus: newStockInitialStatus,
+        allowQuarantine: true,
       });
 
       if (!res.success) {
         setStockFeedback({ type: 'error', message: res.error || 'Failed to register blood stock.' });
       } else {
+        const statusLabel = newStockInitialStatus === 'QUARANTINED' ? 'QUARANTINED (Testing Pending)' : 'AVAILABLE (Usable)';
         setStockFeedback({
           type: 'success',
-          message: `Successfully registered ${res.insertedCount} unit(s) of ${newStockComponent} (${SHORT_BLOOD_GROUPS[newStockGroup]}) into verified inventory.`,
+          message: `Successfully registered ${res.insertedCount} unit(s) of ${newStockComponent} (${SHORT_BLOOD_GROUPS[newStockGroup]}) into ${statusLabel}.`,
         });
         setNewStockBatchRef('');
         await onRefreshData();
@@ -200,7 +340,11 @@ export const HospitalDashboardView: React.FC<HospitalDashboardViewProps> = ({
     } catch (err: any) {
       setStockFeedback({ type: 'error', message: err.message || 'An unexpected error occurred.' });
     } finally {
-      setIsSubmittingStock(false);
+      // Cooldown to lock out double-clicks
+      setTimeout(() => {
+        isSubmittingStockRef.current = false;
+        setIsSubmittingStock(false);
+      }, 500);
     }
   };
 
@@ -503,41 +647,58 @@ export const HospitalDashboardView: React.FC<HospitalDashboardViewProps> = ({
           )}
 
           {/* Metric Cards Row */}
-          <div className="grid grid-cols-2 sm:grid-cols-4 gap-4">
-            <div className="bg-white p-5 rounded-2xl border border-slate-200 shadow-2xs">
-              <div className="flex items-center justify-between text-slate-500 mb-2">
-                <span className="text-xs font-bold uppercase tracking-wider">Usable Units</span>
+          <div className="grid grid-cols-2 sm:grid-cols-5 gap-3">
+            <div className="bg-white p-4 rounded-2xl border border-slate-200 shadow-2xs">
+              <div className="flex items-center justify-between text-slate-500 mb-1.5">
+                <span className="text-[11px] font-bold uppercase tracking-wider">Usable Stock</span>
                 <Droplet className="w-4 h-4 text-emerald-600" />
               </div>
-              <div className="text-3xl font-black text-slate-900">{usableUnits.length}</div>
-              <p className="text-[11px] text-emerald-700 mt-1 font-semibold">Ready for Transfusion</p>
+              <div className="text-2xl sm:text-3xl font-black text-slate-900">{usableUnits.length}</div>
+              <p className="text-[10px] text-emerald-700 mt-0.5 font-semibold">Clinically Cleared</p>
             </div>
 
-            <div className="bg-white p-5 rounded-2xl border border-slate-200 shadow-2xs">
-              <div className="flex items-center justify-between text-slate-500 mb-2">
-                <span className="text-xs font-bold uppercase tracking-wider">Reserved / Transit</span>
+            <div className="bg-white p-4 rounded-2xl border border-amber-200 bg-amber-50/20 shadow-2xs">
+              <div className="flex items-center justify-between text-slate-500 mb-1.5">
+                <span className="text-[11px] font-bold uppercase tracking-wider text-amber-800">Quarantine / QC</span>
                 <Clock className="w-4 h-4 text-amber-600" />
               </div>
-              <div className="text-3xl font-black text-slate-900">{reservedUnits.length}</div>
-              <p className="text-[11px] text-amber-700 mt-1 font-semibold">Committed to Orders</p>
+              <div className="text-2xl sm:text-3xl font-black text-amber-900">{quarantinedUnits.length}</div>
+              <button
+                onClick={() => {
+                  setStatusFilter('QUARANTINED');
+                  setActiveTab('INVENTORY');
+                }}
+                className="text-[10px] text-amber-700 hover:text-amber-900 mt-0.5 font-semibold underline cursor-pointer text-left block"
+              >
+                Review Testing ({quarantinedUnits.length})
+              </button>
             </div>
 
-            <div className="bg-white p-5 rounded-2xl border border-slate-200 shadow-2xs">
-              <div className="flex items-center justify-between text-slate-500 mb-2">
-                <span className="text-xs font-bold uppercase tracking-wider">Expired / Discard</span>
+            <div className="bg-white p-4 rounded-2xl border border-slate-200 shadow-2xs">
+              <div className="flex items-center justify-between text-slate-500 mb-1.5">
+                <span className="text-[11px] font-bold uppercase tracking-wider">Reserved</span>
+                <ShieldCheck className="w-4 h-4 text-amber-600" />
+              </div>
+              <div className="text-2xl sm:text-3xl font-black text-slate-900">{reservedUnits.length}</div>
+              <p className="text-[10px] text-amber-700 mt-0.5 font-semibold">Committed to Orders</p>
+            </div>
+
+            <div className="bg-white p-4 rounded-2xl border border-slate-200 shadow-2xs">
+              <div className="flex items-center justify-between text-slate-500 mb-1.5">
+                <span className="text-[11px] font-bold uppercase tracking-wider">Expired / Discard</span>
                 <X className="w-4 h-4 text-red-600" />
               </div>
-              <div className="text-3xl font-black text-slate-900">{expiredUnits.length}</div>
-              <p className="text-[11px] text-red-600 mt-1 font-semibold">Excluded from Supply</p>
+              <div className="text-2xl sm:text-3xl font-black text-slate-900">{expiredUnits.length}</div>
+              <p className="text-[10px] text-red-600 mt-0.5 font-semibold">Excluded from Supply</p>
             </div>
 
-            <div className="bg-white p-5 rounded-2xl border border-slate-200 shadow-2xs">
-              <div className="flex items-center justify-between text-slate-500 mb-2">
-                <span className="text-xs font-bold uppercase tracking-wider">Pending Orders</span>
+            <div className="bg-white p-4 rounded-2xl border border-slate-200 shadow-2xs">
+              <div className="flex items-center justify-between text-slate-500 mb-1.5">
+                <span className="text-[11px] font-bold uppercase tracking-wider">Pending Orders</span>
                 <Activity className="w-4 h-4 text-blue-600" />
               </div>
-              <div className="text-3xl font-black text-slate-900">{pendingRequests.length}</div>
-              <p className="text-[11px] text-blue-700 mt-1 font-semibold">{fulfilledRequests.length} Fulfilled</p>
+              <div className="text-2xl sm:text-3xl font-black text-slate-900">{pendingRequests.length}</div>
+              <p className="text-[10px] text-blue-700 mt-0.5 font-semibold">{fulfilledRequests.length} Fulfilled</p>
             </div>
           </div>
 
@@ -630,39 +791,48 @@ export const HospitalDashboardView: React.FC<HospitalDashboardViewProps> = ({
          ========================================================================= */}
       {activeTab === 'INVENTORY' && (
         <div className="bg-white p-6 rounded-2xl border border-slate-200 shadow-2xs space-y-5 animate-in fade-in duration-150">
-          <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-4">
+          <div className="flex flex-col lg:flex-row items-start lg:items-center justify-between gap-4">
             <div>
-              <h3 className="text-sm font-bold text-slate-900 flex items-center gap-2">
-                <Box className="w-4 h-4 text-blue-600" />
-                <span>Facility Blood Stock Inventory</span>
-              </h3>
+              <div className="flex items-center gap-2">
+                <Box className="w-5 h-5 text-blue-600" />
+                <h3 className="text-base font-bold text-slate-900">
+                  Facility Blood Stock Inventory
+                </h3>
+                <span className="px-2 py-0.5 rounded-full text-[10px] font-bold bg-blue-100 text-blue-800">
+                  {profile.name}
+                </span>
+              </div>
               <p className="text-xs text-slate-500 mt-0.5">
-                Displaying {filteredUnits.length} of {units.length} total units for {profile.name}.
+                Displaying {filteredUnits.length} of {units.length} total units. Sorted by FEFO (Earliest Expiry first) for clinical safety.
               </p>
             </div>
 
-            {/* Filter Bar */}
-            <div className="flex items-center gap-2 flex-wrap">
-              <div className="flex items-center gap-1 bg-slate-50 p-1 rounded-xl border border-slate-200 text-xs">
-                <Filter className="w-3.5 h-3.5 text-slate-500 ml-1.5" />
+            {/* Filter & Sort Bar */}
+            <div className="flex items-center gap-2 flex-wrap w-full lg:w-auto">
+              {/* Component Filter */}
+              <div className="flex items-center gap-1 bg-slate-50 p-1.5 rounded-xl border border-slate-200 text-xs">
+                <Filter className="w-3.5 h-3.5 text-slate-500 ml-1" />
                 <select
                   value={componentFilter}
                   onChange={(e) => setComponentFilter(e.target.value)}
-                  className="bg-transparent border-none text-slate-700 font-semibold focus:outline-none pr-2 cursor-pointer"
+                  className="bg-transparent border-none text-slate-700 font-semibold focus:outline-none pr-1 cursor-pointer"
+                  title="Filter by Blood Component Type"
                 >
                   <option value="ALL">All Components</option>
                   <option value="PRBC">PRBC (Red Cells)</option>
-                  <option value="PLATELETS">Platelets</option>
+                  <option value="PLATELETS">Platelets (Apheresis)</option>
                   <option value="FFP">Plasma (FFP)</option>
-                  <option value="CRYOPRECIPITATE">Cryo</option>
+                  <option value="CRYOPRECIPITATE">Cryoprecipitate</option>
                 </select>
               </div>
 
-              <div className="bg-slate-50 p-1 rounded-xl border border-slate-200 text-xs">
+              {/* Blood Group Filter */}
+              <div className="bg-slate-50 p-1.5 rounded-xl border border-slate-200 text-xs">
                 <select
                   value={groupFilter}
                   onChange={(e) => setGroupFilter(e.target.value)}
-                  className="bg-transparent border-none text-slate-700 font-semibold focus:outline-none pr-2 cursor-pointer"
+                  className="bg-transparent border-none text-slate-700 font-semibold focus:outline-none pr-1 cursor-pointer font-mono"
+                  title="Filter by Blood Group"
                 >
                   <option value="ALL">All Groups</option>
                   <option value="O_NEG">O−</option>
@@ -676,42 +846,134 @@ export const HospitalDashboardView: React.FC<HospitalDashboardViewProps> = ({
                 </select>
               </div>
 
-              <div className="bg-slate-50 p-1 rounded-xl border border-slate-200 text-xs">
+              {/* Stock Status Filter */}
+              <div className="bg-slate-50 p-1.5 rounded-xl border border-slate-200 text-xs">
                 <select
                   value={statusFilter}
                   onChange={(e) => setStatusFilter(e.target.value)}
-                  className="bg-transparent border-none text-slate-700 font-semibold focus:outline-none pr-2 cursor-pointer"
+                  className="bg-transparent border-none text-slate-700 font-semibold focus:outline-none pr-1 cursor-pointer"
+                  title="Filter by Unit Status"
                 >
-                  <option value="ALL">All Statuses</option>
-                  <option value="AVAILABLE">Available</option>
-                  <option value="RESERVED">Reserved</option>
+                  <option value="ALL">All Statuses ({units.length})</option>
+                  <option value="AVAILABLE">Available / Usable ({usableUnits.length})</option>
+                  <option value="QUARANTINED">Quarantined / In-QC ({quarantinedUnits.length})</option>
+                  <option value="RESERVED">Reserved ({reservedUnits.length})</option>
                   <option value="IN_TRANSIT">In Transit</option>
+                  <option value="EXPIRED">Expired ({expiredUnits.length})</option>
+                  <option value="DISCARDED">Discarded</option>
+                </select>
+              </div>
+
+              {/* Sort By Dropdown */}
+              <div className="bg-slate-50 p-1.5 rounded-xl border border-slate-200 text-xs">
+                <select
+                  value={sortBy}
+                  onChange={(e) => setSortBy(e.target.value as any)}
+                  className="bg-transparent border-none text-slate-700 font-semibold focus:outline-none pr-1 cursor-pointer"
+                  title="Sort Order"
+                >
+                  <option value="FEFO_ASC">Sort: Earliest Expiry (FEFO)</option>
+                  <option value="FEFO_DESC">Sort: Furthest Expiry</option>
+                  <option value="GROUP">Sort: Blood Group (A-Z)</option>
+                  <option value="COMPONENT">Sort: Component Type</option>
+                  <option value="DONATION">Sort: Most Recently Donated</option>
                 </select>
               </div>
             </div>
           </div>
 
-          {filteredUnits.length === 0 ? (
-            <div className="p-10 text-center bg-slate-50 rounded-xl border border-dashed border-slate-200 space-y-2">
-              <Box className="w-8 h-8 text-slate-400 mx-auto" />
-              <h4 className="font-bold text-slate-800 text-sm">No inventory matches active filters</h4>
+          {/* Action Feedback Banner */}
+          {actionFeedback && (
+            <div
+              className={`p-3.5 rounded-xl border text-xs flex items-center justify-between gap-2 ${
+                actionFeedback.type === 'success'
+                  ? 'bg-emerald-50 border-emerald-200 text-emerald-800'
+                  : 'bg-red-50 border-red-200 text-red-800'
+              }`}
+            >
+              <div className="flex items-center gap-2">
+                {actionFeedback.type === 'success' ? (
+                  <CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0" />
+                ) : (
+                  <AlertCircle className="w-4 h-4 text-red-600 shrink-0" />
+                )}
+                <span>{actionFeedback.message}</span>
+              </div>
+              <button
+                onClick={() => setActionFeedback(null)}
+                className="text-slate-400 hover:text-slate-600 cursor-pointer"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+          )}
+
+          {/* Loading State */}
+          {isRefreshing ? (
+            <div className="p-12 text-center bg-blue-50/40 rounded-xl border border-blue-200 animate-pulse space-y-3">
+              <RotateCw className="w-6 h-6 text-blue-600 animate-spin mx-auto" />
+              <h4 className="font-bold text-slate-800 text-sm">
+                Refreshing live inventory for {profile.name}...
+              </h4>
               <p className="text-xs text-slate-500">
-                Adjust filter criteria or click "Add Blood Stock" to record incoming donations.
+                Synchronizing with PostgreSQL <code>public.blood_units</code> under active facility authorization.
               </p>
             </div>
+          ) : filteredUnits.length === 0 ? (
+            /* Honest Empty States */
+            units.length === 0 ? (
+              <div className="p-12 text-center bg-slate-50 rounded-2xl border border-dashed border-slate-300 space-y-3">
+                <Box className="w-10 h-10 text-slate-400 mx-auto" />
+                <h4 className="font-bold text-slate-800 text-base">
+                  No Blood Units in Database for {profile.name}
+                </h4>
+                <p className="text-xs text-slate-500 max-w-md mx-auto leading-relaxed">
+                  The database currently contains zero blood units for this facility. No placeholder stock is fabricated. Use the form below to record newly screened blood units.
+                </p>
+                <div className="pt-2">
+                  <button
+                    onClick={() => setActiveTab('ADD_STOCK')}
+                    className="py-2.5 px-4 bg-emerald-600 hover:bg-emerald-700 text-white font-bold rounded-xl text-xs uppercase tracking-wider transition-colors inline-flex items-center gap-1.5 cursor-pointer shadow-xs"
+                  >
+                    <PlusCircle className="w-4 h-4" />
+                    <span>Register First Blood Batch</span>
+                  </button>
+                </div>
+              </div>
+            ) : (
+              <div className="p-10 text-center bg-slate-50 rounded-xl border border-dashed border-slate-200 space-y-2">
+                <Filter className="w-8 h-8 text-slate-400 mx-auto" />
+                <h4 className="font-bold text-slate-800 text-sm">No inventory matches active filters</h4>
+                <p className="text-xs text-slate-500">
+                  Try adjusting the Component, Blood Group, or Status filters to inspect other units.
+                </p>
+                <button
+                  onClick={() => {
+                    setComponentFilter('ALL');
+                    setGroupFilter('ALL');
+                    setStatusFilter('ALL');
+                  }}
+                  className="px-3 py-1.5 bg-slate-200 hover:bg-slate-300 text-slate-700 font-bold rounded-lg text-xs cursor-pointer transition-colors mt-2"
+                >
+                  Reset All Filters
+                </button>
+              </div>
+            )
           ) : (
-            <div className="overflow-x-auto">
+            /* Populated Inventory Table */
+            <div className="overflow-x-auto rounded-xl border border-slate-200">
               <table className="w-full text-left text-xs border-collapse">
                 <thead>
                   <tr className="bg-slate-50 border-b border-slate-200 text-slate-600 font-bold">
-                    <th className="p-3">Batch / ID</th>
+                    <th className="p-3">Batch / Inventory ID</th>
                     <th className="p-3">Component</th>
                     <th className="p-3">Blood Group</th>
+                    <th className="p-3">Quantity</th>
                     <th className="p-3">Status</th>
-                    <th className="p-3">Donation Date</th>
                     <th className="p-3">Expiry (FEFO)</th>
                     <th className="p-3">Shelf Life Remaining</th>
-                    <th className="p-3">QC Status</th>
+                    <th className="p-3">QC & Verification</th>
+                    <th className="p-3 text-right">Actions</th>
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-slate-100">
@@ -719,59 +981,153 @@ export const HospitalDashboardView: React.FC<HospitalDashboardViewProps> = ({
                     const hoursLeft = Math.round(
                       (new Date(unit.expiresAt).getTime() - now) / (3600 * 1000)
                     );
-                    const isExpired = hoursLeft <= 0;
+                    const isExpired = hoursLeft <= 0 || unit.status === 'EXPIRED';
                     const isNearExpiry = hoursLeft > 0 && hoursLeft <= 48;
+                    const isQuarantined = unit.status === 'QUARANTINED';
+                    const isAvailable = unit.status === 'AVAILABLE' && !isExpired;
+                    const isReleasing = isReleasingUnitId === unit.id;
 
                     return (
                       <tr key={unit.id} className="hover:bg-slate-50/80 transition-colors">
+                        {/* Batch / Inventory ID */}
                         <td className="p-3 font-mono text-slate-800">
-                          {unit.syntheticBatchId || unit.id.slice(0, 8)}
+                          <div className="font-bold text-slate-900">
+                            {unit.syntheticBatchId || `BATCH-${unit.id.slice(0, 8).toUpperCase()}`}
+                          </div>
+                          <div className="text-[10px] text-slate-400 font-mono">
+                            UUID: {unit.id.slice(0, 8)}...
+                          </div>
                         </td>
+
+                        {/* Component */}
                         <td className="p-3 font-bold text-slate-800">
                           {unit.componentType}
                         </td>
+
+                        {/* Blood Group */}
                         <td className="p-3">
                           <span className="px-2 py-0.5 rounded font-mono font-bold bg-blue-50 text-blue-900 border border-blue-200">
                             {SHORT_BLOOD_GROUPS[unit.bloodGroup] || unit.bloodGroup}
                           </span>
                         </td>
+
+                        {/* Quantity */}
+                        <td className="p-3 font-mono text-slate-800 font-semibold">
+                          1 Unit
+                        </td>
+
+                        {/* Status */}
                         <td className="p-3">
                           <span
-                            className={`px-2 py-0.5 rounded-full font-bold text-[10px] uppercase tracking-wider ${
-                              unit.status === 'AVAILABLE'
-                                ? 'bg-emerald-100 text-emerald-800'
+                            className={`px-2 py-0.5 rounded-full font-bold text-[10px] uppercase tracking-wider inline-flex items-center gap-1 ${
+                              isQuarantined
+                                ? 'bg-amber-100 text-amber-800 border border-amber-300'
+                                : isAvailable
+                                ? 'bg-emerald-100 text-emerald-800 border border-emerald-200'
                                 : unit.status === 'RESERVED'
-                                ? 'bg-amber-100 text-amber-800'
-                                : 'bg-indigo-100 text-indigo-800'
+                                ? 'bg-yellow-100 text-yellow-800 border border-yellow-200'
+                                : isExpired
+                                ? 'bg-red-100 text-red-800 border border-red-200'
+                                : 'bg-slate-100 text-slate-800 border border-slate-200'
                             }`}
                           >
-                            {unit.status}
+                            {isQuarantined ? (
+                              <>
+                                <Clock className="w-3 h-3 text-amber-600" />
+                                <span>Quarantined</span>
+                              </>
+                            ) : isAvailable ? (
+                              <>
+                                <Check className="w-3 h-3 text-emerald-600" />
+                                <span>Available</span>
+                              </>
+                            ) : (
+                              <span>{unit.status}</span>
+                            )}
                           </span>
                         </td>
-                        <td className="p-3 text-slate-500 font-mono text-[11px]">
-                          {unit.donationDate ? new Date(unit.donationDate).toLocaleDateString() : '-'}
-                        </td>
+
+                        {/* Expiry Date (FEFO) */}
                         <td className="p-3 font-mono text-[11px]">
-                          {new Date(unit.expiresAt).toLocaleString()}
+                          {new Date(unit.expiresAt).toLocaleString(undefined, {
+                            dateStyle: 'short',
+                            timeStyle: 'short',
+                          })}
                         </td>
+
+                        {/* Shelf Life Remaining */}
                         <td className="p-3">
                           {isExpired ? (
-                            <span className="font-bold text-red-600">EXPIRED</span>
+                            <span className="px-2 py-0.5 rounded bg-red-100 text-red-800 font-bold text-[10px]">
+                              EXPIRED
+                            </span>
                           ) : (
                             <span
-                              className={`font-semibold ${
-                                isNearExpiry ? 'text-amber-600 font-bold' : 'text-slate-700'
+                              className={`text-[11px] font-semibold ${
+                                isNearExpiry ? 'text-amber-700 font-bold flex items-center gap-1' : 'text-slate-700'
                               }`}
                             >
-                              {hoursLeft} hours
+                              {isNearExpiry && <AlertTriangle className="w-3 h-3 text-amber-600 inline shrink-0" />}
+                              <span>{hoursLeft} hours</span>
                             </span>
                           )}
                         </td>
+
+                        {/* QC / Verification Status */}
                         <td className="p-3">
-                          <span className="px-2 py-0.5 rounded bg-emerald-50 text-emerald-800 border border-emerald-200 text-[10px] font-bold flex items-center gap-1 w-fit">
-                            <Check className="w-3 h-3 text-emerald-600" />
-                            <span>Screened & Cleared</span>
-                          </span>
+                          {isQuarantined ? (
+                            <span className="px-2 py-0.5 rounded bg-amber-50 text-amber-800 border border-amber-200 text-[10px] font-bold flex items-center gap-1 w-fit">
+                              <Clock className="w-3 h-3 text-amber-600" />
+                              <span>Testing Pending</span>
+                            </span>
+                          ) : isExpired ? (
+                            <span className="px-2 py-0.5 rounded bg-red-50 text-red-700 border border-red-200 text-[10px] font-bold flex items-center gap-1 w-fit">
+                              <X className="w-3 h-3 text-red-500" />
+                              <span>Expired / Unusable</span>
+                            </span>
+                          ) : (
+                            <span className="px-2 py-0.5 rounded bg-emerald-50 text-emerald-800 border border-emerald-200 text-[10px] font-bold flex items-center gap-1 w-fit">
+                              <Check className="w-3 h-3 text-emerald-600" />
+                              <span>Screened & Cleared</span>
+                            </span>
+                          )}
+                        </td>
+
+                        {/* Actions */}
+                        <td className="p-3 text-right">
+                          <div className="flex items-center justify-end gap-1.5">
+                            {isQuarantined && (
+                              <button
+                                onClick={() => handleReleaseQuarantine(unit)}
+                                disabled={isReleasing}
+                                className="px-2.5 py-1 bg-emerald-600 hover:bg-emerald-700 active:bg-emerald-800 text-white font-bold rounded-lg text-[10px] uppercase tracking-wider transition-colors inline-flex items-center gap-1 cursor-pointer disabled:opacity-50"
+                                title="Release QC: Authorized clinical release verifying mandatory infectious disease (TTI) screening is negative. Transitions unit into AVAILABLE usable inventory."
+                              >
+                                {isReleasing ? (
+                                  <RotateCw className="w-3 h-3 animate-spin" />
+                                ) : (
+                                  <CheckCircle2 className="w-3 h-3" />
+                                )}
+                                <span>Release QC</span>
+                              </button>
+                            )}
+
+                            {(isQuarantined || isExpired) && (
+                              <button
+                                onClick={() => openDiscardModal(unit)}
+                                className="px-2 py-1 bg-slate-100 hover:bg-red-50 text-slate-600 hover:text-red-700 border border-slate-300 hover:border-red-300 font-bold rounded-lg text-[10px] uppercase tracking-wider transition-colors cursor-pointer"
+                                title="Discard: Safely mark unit unusable with a mandatory operational/clinical reason. Excludes unit from usable inventory while preserving full clinical audit history."
+                              >
+                                Discard
+                              </button>
+                            )}
+
+                            {isAvailable && (
+                              <span className="text-[10px] text-emerald-700 font-semibold px-2 py-0.5">
+                                Active Ready
+                              </span>
+                            )}
+                          </div>
                         </td>
                       </tr>
                     );
@@ -789,12 +1145,14 @@ export const HospitalDashboardView: React.FC<HospitalDashboardViewProps> = ({
       {activeTab === 'ADD_STOCK' && (
         <div className="bg-white p-6 rounded-2xl border border-slate-200 shadow-2xs max-w-2xl mx-auto space-y-6 animate-in fade-in duration-150">
           <div>
-            <h3 className="text-base font-bold text-slate-900 flex items-center gap-2">
+            <div className="flex items-center gap-2">
               <PlusCircle className="w-5 h-5 text-emerald-600" />
-              <span>Register New Blood Stock</span>
-            </h3>
+              <h3 className="text-base font-bold text-slate-900">
+                Register New Blood Stock
+              </h3>
+            </div>
             <p className="text-xs text-slate-500 mt-1">
-              Add verified, screened donor units to {profile.name}'s official inventory. Strictly complies with patient safety and storage compliance rules.
+              Add newly donated or delivered units to <strong>{profile.name}</strong>. Stock defaults to Quarantine until laboratory serological screening (TTI) is verified.
             </p>
           </div>
 
@@ -811,11 +1169,76 @@ export const HospitalDashboardView: React.FC<HospitalDashboardViewProps> = ({
               ) : (
                 <AlertCircle className="w-4 h-4 shrink-0 text-red-600 mt-0.5" />
               )}
-              <span>{stockFeedback.message}</span>
+              <div className="flex-1">
+                <span className="font-semibold">{stockFeedback.message}</span>
+              </div>
             </div>
           )}
 
-          <form onSubmit={handleAddStockSubmit} className="space-y-4">
+          <form onSubmit={handleAddStockSubmit} className="space-y-5">
+            {/* Entry Mode / Quarantine Selector */}
+            <div className="p-4 bg-slate-50 rounded-xl border border-slate-200 space-y-3">
+              <span className="block text-xs font-bold text-slate-800 uppercase tracking-wider">
+                Registration & Quality Control Status
+              </span>
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                <label
+                  className={`p-3 rounded-xl border cursor-pointer transition-all flex items-start gap-2.5 ${
+                    newStockInitialStatus === 'QUARANTINED'
+                      ? 'bg-amber-50/80 border-amber-300 text-amber-900 shadow-2xs'
+                      : 'bg-white border-slate-200 text-slate-700 hover:border-slate-300'
+                  }`}
+                >
+                  <input
+                    type="radio"
+                    name="stockStatusMode"
+                    checked={newStockInitialStatus === 'QUARANTINED'}
+                    onChange={() => {
+                      setNewStockInitialStatus('QUARANTINED');
+                      setNewStockScreened(false);
+                    }}
+                    className="mt-0.5 text-amber-600 focus:ring-amber-500"
+                  />
+                  <div>
+                    <span className="font-bold text-xs block">
+                      Quarantine / Testing Pending
+                    </span>
+                    <span className="text-[11px] text-slate-500 leading-tight block mt-0.5">
+                      Recommended. Units are held in quarantine and cannot be allocated until certified in lab QC.
+                    </span>
+                  </div>
+                </label>
+
+                <label
+                  className={`p-3 rounded-xl border cursor-pointer transition-all flex items-start gap-2.5 ${
+                    newStockInitialStatus === 'AVAILABLE'
+                      ? 'bg-emerald-50/80 border-emerald-300 text-emerald-900 shadow-2xs'
+                      : 'bg-white border-slate-200 text-slate-700 hover:border-slate-300'
+                  }`}
+                >
+                  <input
+                    type="radio"
+                    name="stockStatusMode"
+                    checked={newStockInitialStatus === 'AVAILABLE'}
+                    onChange={() => {
+                      setNewStockInitialStatus('AVAILABLE');
+                      setNewStockScreened(true);
+                    }}
+                    className="mt-0.5 text-emerald-600 focus:ring-emerald-500"
+                  />
+                  <div>
+                    <span className="font-bold text-xs block">
+                      Direct Usable Release
+                    </span>
+                    <span className="text-[11px] text-slate-500 leading-tight block mt-0.5">
+                      Requires certified serological TTI screening results and valid batch reference.
+                    </span>
+                  </div>
+                </label>
+              </div>
+            </div>
+
+            {/* Component & Blood Group */}
             <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
               <div>
                 <label className="block text-xs font-bold text-slate-800 mb-1">
@@ -823,13 +1246,13 @@ export const HospitalDashboardView: React.FC<HospitalDashboardViewProps> = ({
                 </label>
                 <select
                   value={newStockComponent}
-                  onChange={(e) => setNewStockComponent(e.target.value as BloodComponentType)}
-                  className="w-full bg-slate-50 border border-slate-300 rounded-xl px-3 py-2 text-xs font-semibold text-slate-800 focus:outline-none focus:ring-2 focus:ring-blue-500"
+                  onChange={(e) => handleComponentChange(e.target.value as BloodComponentType)}
+                  className="w-full bg-slate-50 border border-slate-300 rounded-xl px-3 py-2 text-xs font-semibold text-slate-800 focus:outline-none focus:ring-2 focus:ring-blue-500 cursor-pointer"
                 >
-                  <option value="PRBC">Packed Red Blood Cells (PRBC)</option>
-                  <option value="PLATELETS">Platelets (Apheresis)</option>
-                  <option value="FFP">Fresh Frozen Plasma (FFP)</option>
-                  <option value="CRYOPRECIPITATE">Cryoprecipitate (CRYO)</option>
+                  <option value="PRBC">Packed Red Blood Cells (PRBC) ~35-42d</option>
+                  <option value="PLATELETS">Platelets (Apheresis) ~5d</option>
+                  <option value="FFP">Fresh Frozen Plasma (FFP) ~365d</option>
+                  <option value="CRYOPRECIPITATE">Cryoprecipitate (CRYO) ~365d</option>
                 </select>
               </div>
 
@@ -840,9 +1263,9 @@ export const HospitalDashboardView: React.FC<HospitalDashboardViewProps> = ({
                 <select
                   value={newStockGroup}
                   onChange={(e) => setNewStockGroup(e.target.value as BloodGroup)}
-                  className="w-full bg-slate-50 border border-slate-300 rounded-xl px-3 py-2 text-xs font-semibold text-slate-800 focus:outline-none focus:ring-2 focus:ring-blue-500 font-mono"
+                  className="w-full bg-slate-50 border border-slate-300 rounded-xl px-3 py-2 text-xs font-semibold text-slate-800 focus:outline-none focus:ring-2 focus:ring-blue-500 font-mono cursor-pointer"
                 >
-                  <option value="O_NEG">O− (O Negative - Universal RBC)</option>
+                  <option value="O_NEG">O− (O Negative - Universal Red Cell)</option>
                   <option value="O_POS">O+ (O Positive)</option>
                   <option value="A_NEG">A− (A Negative)</option>
                   <option value="A_POS">A+ (A Positive)</option>
@@ -854,6 +1277,7 @@ export const HospitalDashboardView: React.FC<HospitalDashboardViewProps> = ({
               </div>
             </div>
 
+            {/* Quantity & Donation Date */}
             <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
               <div>
                 <label className="block text-xs font-bold text-slate-800 mb-1">
@@ -862,14 +1286,38 @@ export const HospitalDashboardView: React.FC<HospitalDashboardViewProps> = ({
                 <input
                   type="number"
                   min="1"
-                  max="50"
+                  max="100"
+                  step="1"
                   value={newStockQuantity}
                   onChange={(e) => setNewStockQuantity(parseInt(e.target.value, 10) || 1)}
                   required
                   className="w-full bg-slate-50 border border-slate-300 rounded-xl px-3 py-2 text-xs font-semibold text-slate-800 focus:outline-none focus:ring-2 focus:ring-blue-500"
                 />
+                <span className="text-[10px] text-slate-500 mt-0.5 block">
+                  Integer between 1 and 100 units per batch.
+                </span>
               </div>
 
+              <div>
+                <label className="block text-xs font-bold text-slate-800 mb-1">
+                  Donation Date <span className="text-red-500">*</span>
+                </label>
+                <input
+                  type="date"
+                  max={new Date().toISOString().split('T')[0]}
+                  value={newStockDonationDate}
+                  onChange={(e) => setNewStockDonationDate(e.target.value)}
+                  required
+                  className="w-full bg-slate-50 border border-slate-300 rounded-xl px-3 py-2 text-xs font-semibold text-slate-800 focus:outline-none focus:ring-2 focus:ring-blue-500 cursor-pointer"
+                />
+                <span className="text-[10px] text-slate-500 mt-0.5 block">
+                  Must be today or a past date.
+                </span>
+              </div>
+            </div>
+
+            {/* Shelf Life & Batch Ref */}
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
               <div>
                 <label className="block text-xs font-bold text-slate-800 mb-1">
                   Shelf Life Remaining (Days) <span className="text-red-500">*</span>
@@ -883,37 +1331,50 @@ export const HospitalDashboardView: React.FC<HospitalDashboardViewProps> = ({
                   required
                   className="w-full bg-slate-50 border border-slate-300 rounded-xl px-3 py-2 text-xs font-semibold text-slate-800 focus:outline-none focus:ring-2 focus:ring-blue-500"
                 />
+                <span className="text-[10px] text-slate-500 mt-0.5 block">
+                  Calculated expiry: {new Date(Date.now() + newStockExpiryDays * 24 * 3600 * 1000).toLocaleDateString()}
+                </span>
+              </div>
+
+              <div>
+                <label className="block text-xs font-bold text-slate-800 mb-1">
+                  Batch / Donation Reference {newStockInitialStatus === 'AVAILABLE' && <span className="text-red-500">*</span>}
+                </label>
+                <input
+                  type="text"
+                  placeholder="e.g. BATCH-JPR-2026-09A"
+                  value={newStockBatchRef}
+                  onChange={(e) => setNewStockBatchRef(e.target.value)}
+                  required={newStockInitialStatus === 'AVAILABLE'}
+                  className="w-full bg-slate-50 border border-slate-300 rounded-xl px-3 py-2 text-xs font-mono text-slate-800 focus:outline-none focus:ring-2 focus:ring-blue-500"
+                />
+                <span className="text-[10px] text-slate-500 mt-0.5 block">
+                  Donor blood bank laboratory identification code.
+                </span>
               </div>
             </div>
 
-            <div>
-              <label className="block text-xs font-bold text-slate-800 mb-1">
-                Batch / Donation Reference (Optional)
-              </label>
-              <input
-                type="text"
-                placeholder="e.g. BATCH-JPR-2026-09A"
-                value={newStockBatchRef}
-                onChange={(e) => setNewStockBatchRef(e.target.value)}
-                className="w-full bg-slate-50 border border-slate-300 rounded-xl px-3 py-2 text-xs font-mono text-slate-800 focus:outline-none focus:ring-2 focus:ring-blue-500"
-              />
-            </div>
-
-            {/* Quality & Screening Checkbox */}
-            <div className="p-3 bg-slate-50 rounded-xl border border-slate-200">
+            {/* Quality & Serology Screening Checkbox */}
+            <div className="p-3.5 bg-slate-50 rounded-xl border border-slate-200">
               <label className="flex items-start gap-2.5 cursor-pointer">
                 <input
                   type="checkbox"
                   checked={newStockScreened}
-                  onChange={(e) => setNewStockScreened(e.target.checked)}
+                  onChange={(e) => {
+                    const checked = e.target.checked;
+                    setNewStockScreened(checked);
+                    if (!checked && newStockInitialStatus === 'AVAILABLE') {
+                      setNewStockInitialStatus('QUARANTINED');
+                    }
+                  }}
                   className="mt-0.5 rounded text-blue-600 focus:ring-blue-500"
                 />
                 <div className="text-xs">
                   <span className="font-bold text-slate-900 block">
-                    Quality Control & Serology Verified
+                    Quality Control & Serology Testing Verified
                   </span>
-                  <span className="text-[11px] text-slate-500 leading-relaxed">
-                    Confirm that mandatory transfusion-transmissible infection (TTI) screenings have cleared according to clinical standards.
+                  <span className="text-[11px] text-slate-500 leading-relaxed block mt-0.5">
+                    Confirm that mandatory transfusion-transmissible infection (TTI) screenings (HIV, Hep B/C, Syphilis, Malaria) have cleared according to Indian Drug & Cosmetics Act rules.
                   </span>
                 </div>
               </label>
@@ -925,11 +1386,13 @@ export const HospitalDashboardView: React.FC<HospitalDashboardViewProps> = ({
               className="w-full py-3 px-4 bg-emerald-600 hover:bg-emerald-700 active:bg-emerald-800 text-white font-bold rounded-xl text-xs uppercase tracking-wider transition-all shadow-xs flex items-center justify-center gap-2 cursor-pointer disabled:opacity-50"
             >
               {isSubmittingStock ? (
-                <span>Registering Units...</span>
+                <span>Registering Units to Database...</span>
               ) : (
                 <>
                   <PlusCircle className="w-4 h-4" />
-                  <span>Register Stock to {profile.name}</span>
+                  <span>
+                    Register {newStockQuantity} Unit(s) to {profile.name}
+                  </span>
                 </>
               )}
             </button>
@@ -1281,6 +1744,108 @@ export const HospitalDashboardView: React.FC<HospitalDashboardViewProps> = ({
                   </p>
                 </div>
               ))}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Discard Confirmation Modal */}
+      {discardTargetUnit && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/50 backdrop-blur-xs p-4">
+          <div className="bg-white rounded-2xl border border-slate-200 shadow-xl max-w-md w-full p-6 space-y-4 animate-in fade-in zoom-in-95 duration-150">
+            <div className="flex items-start justify-between gap-3">
+              <div className="flex items-center gap-2 text-red-600 font-bold text-base">
+                <AlertCircle className="w-5 h-5 shrink-0" />
+                <h4>Discard Blood Unit</h4>
+              </div>
+              <button
+                onClick={() => setDiscardTargetUnit(null)}
+                className="text-slate-400 hover:text-slate-600 cursor-pointer p-1"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+
+            <p className="text-xs text-slate-600 leading-relaxed">
+              Mark this unit as unusable. A specific clinical or operational reason is mandatory to maintain regulatory compliance and audit history.
+            </p>
+
+            <div className="p-3 bg-slate-50 rounded-xl border border-slate-200 text-xs space-y-1 font-mono">
+              <div className="flex justify-between text-slate-600">
+                <span>Unit ID:</span>
+                <span className="font-bold text-slate-900">{discardTargetUnit.id.slice(0, 8)}...</span>
+              </div>
+              <div className="flex justify-between text-slate-600">
+                <span>Component / Group:</span>
+                <span className="font-bold text-slate-900">
+                  {discardTargetUnit.componentType} ({SHORT_BLOOD_GROUPS[discardTargetUnit.bloodGroup] || discardTargetUnit.bloodGroup})
+                </span>
+              </div>
+              <div className="flex justify-between text-slate-600">
+                <span>Current Status:</span>
+                <span className="font-bold text-amber-700">{discardTargetUnit.status}</span>
+              </div>
+            </div>
+
+            <div className="space-y-3">
+              <div>
+                <label className="block text-xs font-bold text-slate-800 mb-1">
+                  Discard Reason <span className="text-red-500">*</span>
+                </label>
+                <select
+                  value={discardReasonCategory}
+                  onChange={(e) => setDiscardReasonCategory(e.target.value)}
+                  className="w-full bg-slate-50 border border-slate-300 rounded-xl px-3 py-2 text-xs font-semibold text-slate-800 focus:outline-none focus:ring-2 focus:ring-red-500 cursor-pointer"
+                >
+                  <option value="QC Screening Failed (TTI Positive)">QC Screening Failed (TTI Positive)</option>
+                  <option value="Expired / Stability Exceeded">Expired / Stability Exceeded</option>
+                  <option value="Hemolysis / Clot Observed">Hemolysis / Clot Observed</option>
+                  <option value="Temperature Excursion / Cold-Chain Deviation">Temperature Excursion / Cold-Chain Deviation</option>
+                  <option value="Broken Port Seal / Leakage / Container Defect">Broken Port Seal / Leakage / Container Defect</option>
+                  <option value="Operator Clinical Discard">Operator Clinical Discard</option>
+                </select>
+              </div>
+
+              <div>
+                <label className="block text-xs font-bold text-slate-800 mb-1">
+                  Additional Operator Notes (Optional)
+                </label>
+                <input
+                  type="text"
+                  placeholder="e.g. Visual inspection showed micro-clots during cross-match"
+                  value={discardNote}
+                  onChange={(e) => setDiscardNote(e.target.value)}
+                  className="w-full bg-slate-50 border border-slate-300 rounded-xl px-3 py-2 text-xs text-slate-800 focus:outline-none focus:ring-2 focus:ring-red-500"
+                />
+              </div>
+            </div>
+
+            <div className="p-3 bg-amber-50 rounded-xl border border-amber-200 text-[11px] text-amber-800 leading-tight">
+              <strong>Notice:</strong> Discarded units are immediately excluded from all usable supply and cannot be allocated. Full history is preserved.
+            </div>
+
+            <div className="flex items-center justify-end gap-2 pt-2">
+              <button
+                type="button"
+                onClick={() => setDiscardTargetUnit(null)}
+                disabled={isDiscardingUnit}
+                className="px-4 py-2 bg-slate-100 hover:bg-slate-200 text-slate-700 font-bold rounded-xl text-xs cursor-pointer transition-colors"
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                onClick={handleConfirmDiscard}
+                disabled={isDiscardingUnit}
+                className="px-4 py-2 bg-red-600 hover:bg-red-700 active:bg-red-800 text-white font-bold rounded-xl text-xs uppercase tracking-wider transition-colors inline-flex items-center gap-1.5 cursor-pointer disabled:opacity-50"
+              >
+                {isDiscardingUnit ? (
+                  <RotateCw className="w-3.5 h-3.5 animate-spin" />
+                ) : (
+                  <X className="w-3.5 h-3.5" />
+                )}
+                <span>Confirm Discard</span>
+              </button>
             </div>
           </div>
         </div>

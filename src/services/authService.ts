@@ -532,6 +532,24 @@ export const authService = {
         console.error('[AuthService] Error checking session:', err);
       }
     }
+
+    // Demo fallback for offline / hackathon testing
+    const savedId = this.getActiveHospitalId();
+    if (savedId) {
+      const matched = matchJaipurHospital(JAIPUR_DEMO_HOSPITALS, savedId);
+      if (matched) {
+        return {
+          session: null,
+          user: {
+            id: 'mock-auth-jaipur-demo-001',
+            email: 'demo@bloodstock.demo',
+          } as any,
+          profile: matched,
+          userHospitals: JAIPUR_DEMO_HOSPITALS,
+        };
+      }
+    }
+
     return { session: null, user: null, profile: null, userHospitals: [] };
   },
 };

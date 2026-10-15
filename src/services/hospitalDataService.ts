@@ -5,8 +5,8 @@
  */
 
 import { supabase, isSupabaseConfigured } from '../lib/supabase';
-import { HospitalProfile } from './authService';
-import { BloodUnit, BloodRequest, BloodComponentType, BloodGroup, RequestUrgency } from '../types/bloodstock';
+import { HospitalProfile, authService } from './authService';
+import { BloodUnit, BloodRequest, BloodComponentType, BloodGroup, RequestUrgency, UnitStatus } from '../types/bloodstock';
 import { checkBiologicalCompatibility } from './compatibilityRules';
 
 export interface NetworkRecommendation {
@@ -67,10 +67,82 @@ export const JAIPUR_TRANSIT_MATRIX: Record<string, Record<string, number>> = {
 const memoryStock: Record<string, BloodUnit[]> = {};
 const memoryRequests: Record<string, BloodRequest[]> = {};
 
+const VALID_COMPONENT_TYPES: BloodComponentType[] = ['PRBC', 'PLATELETS', 'FFP', 'CRYOPRECIPITATE'];
+const VALID_BLOOD_GROUPS: BloodGroup[] = ['O_NEG', 'O_POS', 'A_NEG', 'A_POS', 'B_NEG', 'B_POS', 'AB_NEG', 'AB_POS'];
+
 export const hospitalDataService = {
   /**
+   * Helper to identify strictly confirmed demo/test inventory records.
+   * NEVER matches genuine clinical stock based only on component, blood group, or date.
+   */
+  isConfirmedDemoRecord(record: { id?: string; syntheticBatchId?: string }): boolean {
+    if (!record || !record.id) return false;
+    const id = record.id;
+    return (
+      id.startsWith('unit-db-') ||
+      id.startsWith('unit-test-') ||
+      id.startsWith('unit-inserted-') ||
+      id.startsWith('UNIT-PRBC-') ||
+      id.startsWith('UNIT-PLT-') ||
+      id.startsWith('UNIT-FFP-') ||
+      id.startsWith('UNIT-CRYO-') ||
+      id.startsWith('REC-') ||
+      (typeof id === 'string' && /^unit-[a-b0-9]{4}-\d+-\d+$/.test(id)) ||
+      (typeof record.syntheticBatchId === 'string' &&
+        (record.syntheticBatchId.startsWith('BATCH-SYNTH-') || record.syntheticBatchId.startsWith('BATCH-JPR-')))
+    );
+  },
+
+  /**
+   * Purges strictly confirmed demo/test records from active store while strictly preserving
+   * all manually added inventory, hospital records, blood requests, and reservations.
+   */
+  async purgeConfirmedDemoRecords(hospitalId?: string): Promise<{ removedCount: number }> {
+    let removedCount = 0;
+    if (isSupabaseConfigured()) {
+      try {
+        let query = supabase.from('blood_units').select('id');
+        if (hospitalId) {
+          query = query.eq('hospital_id', hospitalId);
+        }
+        const { data } = await query;
+        if (data && data.length > 0) {
+          const demoIds = data
+            .filter((row: any) => this.isConfirmedDemoRecord(row))
+            .map((r: any) => r.id);
+
+          if (demoIds.length > 0) {
+            const { error: delErr } = await supabase
+              .from('blood_units')
+              .delete()
+              .in('id', demoIds);
+            if (!delErr) {
+              removedCount += demoIds.length;
+            }
+          }
+        }
+      } catch (e) {
+        console.warn('[HospitalDataService] Note on demo records purge:', e);
+      }
+    }
+
+    // Clean in-memory fallback stores
+    Object.keys(memoryStock).forEach((hId) => {
+      if (!hospitalId || hospitalId === hId) {
+        const before = memoryStock[hId].length;
+        memoryStock[hId] = memoryStock[hId].filter((u) => !this.isConfirmedDemoRecord(u));
+        removedCount += (before - memoryStock[hId].length);
+      }
+    });
+
+    return { removedCount };
+  },
+
+  /**
    * Fetches blood units belonging to the active hospital.
-   * Strictly uses actual database records and displays honest empty state if none exist.
+   * Strictly uses Supabase as the single source of truth without injecting mock or demo inventory.
+   * Displays an honest empty state if no stock exists.
+   * Sorts eligible stock by earliest expiry (FEFO).
    */
   async getHospitalInventory(hospital: HospitalProfile): Promise<BloodUnit[]> {
     if (isSupabaseConfigured()) {
@@ -83,35 +155,49 @@ export const hospitalDataService = {
 
         if (error) {
           console.warn('[HospitalDataService] RLS or query note for blood_units:', error.message);
+          return [];
         }
 
         if (data) {
-          // Rule A: Return actual database records. If length is 0, return [] (honest empty state)
-          return data.map((row: any) => ({
-            id: row.id,
-            hospitalId: row.hospital_id,
-            componentType: row.component_type as BloodComponentType,
-            bloodGroup: row.blood_group as BloodGroup,
-            donationDate: row.created_at || new Date().toISOString(),
-            expiresAt: row.expiry_at,
-            status: row.unit_status || 'AVAILABLE',
-            handlingBufferMinutes: row.component_type === 'FFP' ? 35 : 25,
-            storageTemperatureCelsius:
-              row.component_type === 'PRBC' ? 4 : row.component_type === 'PLATELETS' ? 22 : -20,
-            syntheticBatchId: `BATCH-${row.id.slice(0, 8).toUpperCase()}`,
-          }));
+          const nowMs = Date.now();
+          // Filter out any confirmed demo units and return actual records
+          return data
+            .filter((row: any) => !this.isConfirmedDemoRecord(row))
+            .map((row: any) => {
+              const isPastExpiry = new Date(row.expiry_at).getTime() <= nowMs;
+              let status = (row.unit_status || 'AVAILABLE') as UnitStatus;
+              if (isPastExpiry && status !== 'DISCARDED') {
+                status = 'EXPIRED';
+              }
+
+              return {
+                id: row.id,
+                hospitalId: row.hospital_id,
+                componentType: row.component_type as BloodComponentType,
+                bloodGroup: row.blood_group as BloodGroup,
+                donationDate: row.created_at || new Date().toISOString(),
+                expiresAt: row.expiry_at,
+                status,
+                handlingBufferMinutes: row.component_type === 'FFP' ? 35 : 25,
+                storageTemperatureCelsius:
+                  row.component_type === 'PRBC' ? 4 : row.component_type === 'PLATELETS' ? 22 : -20,
+                syntheticBatchId: `BATCH-${row.id.slice(0, 8).toUpperCase()}`,
+              };
+            });
         }
+        return [];
       } catch (err: any) {
         console.error('[HospitalDataService] Failed to query live blood_units:', err);
+        return [];
       }
     }
 
-    // In offline demo fallback:
-    if (!memoryStock[hospital.id]) {
-      // Initialize with deterministic starter units for Jaipur testing
-      memoryStock[hospital.id] = this.generateSimulatedInventory(hospital);
-    }
-    return memoryStock[hospital.id];
+    // In offline fallback: NEVER inject simulated demo inventory.
+    // Display actual stored units without demo injection.
+    const units = memoryStock[hospital.id] || [];
+    return [...units]
+      .filter((u) => !this.isConfirmedDemoRecord(u))
+      .sort((a, b) => new Date(a.expiresAt).getTime() - new Date(b.expiresAt).getTime());
   },
 
   /**
@@ -128,6 +214,7 @@ export const hospitalDataService = {
 
         if (error) {
           console.warn('[HospitalDataService] RLS or query note for blood_requests:', error.message);
+          return [];
         }
 
         if (data) {
@@ -145,20 +232,22 @@ export const hospitalDataService = {
             allocatedUnitIds: [],
           }));
         }
+        return [];
       } catch (err: any) {
         console.error('[HospitalDataService] Failed to query live blood_requests:', err);
+        return [];
       }
     }
 
     if (!memoryRequests[hospital.id]) {
-      memoryRequests[hospital.id] = this.generateSimulatedRequests(hospital);
+      memoryRequests[hospital.id] = [];
     }
     return memoryRequests[hospital.id];
   },
 
   /**
    * Registers new blood stock under the active hospital.
-   * Validates dates, quantities, component types, and prevents adding already-expired stock.
+   * Validates dates, quantities, component types, authorization, and quarantine status.
    */
   async addBloodStock(
     hospital: HospitalProfile,
@@ -170,17 +259,56 @@ export const hospitalDataService = {
       donationDate?: string;
       batchRef?: string;
       screeningPassed: boolean;
+      initialStatus?: 'AVAILABLE' | 'QUARANTINED';
+      allowQuarantine?: boolean;
       storageTempCelsius?: number;
     }
-  ): Promise<{ success: boolean; insertedCount: number; error?: string }> {
-    // 1. Validation checks
-    if (!stockData.quantity || stockData.quantity <= 0) {
-      return { success: false, insertedCount: 0, error: 'Quantity must be at least 1 unit.' };
+  ): Promise<{ success: boolean; insertedCount: number; unitIds?: string[]; error?: string }> {
+    // 1. Authorization check: scope write to authenticated user's active authorized hospital
+    const activeHospitalId = authService.getActiveHospitalId();
+    if (activeHospitalId && activeHospitalId !== hospital.id) {
+      return {
+        success: false,
+        insertedCount: 0,
+        error: `Authorization Error: Active session is scoped to ${activeHospitalId}, not ${hospital.id}. Cross-facility inventory writes are blocked.`,
+      };
     }
 
+    // 2. Quantity validation
+    if (
+      typeof stockData.quantity !== 'number' ||
+      !Number.isInteger(stockData.quantity) ||
+      stockData.quantity <= 0 ||
+      stockData.quantity > 100
+    ) {
+      return {
+        success: false,
+        insertedCount: 0,
+        error: 'Invalid quantity: Must be an integer between 1 and 100 units.',
+      };
+    }
+
+    // 3. Component & Blood Group validation
+    if (!VALID_COMPONENT_TYPES.includes(stockData.componentType)) {
+      return {
+        success: false,
+        insertedCount: 0,
+        error: `Invalid component type: Must be one of ${VALID_COMPONENT_TYPES.join(', ')}.`,
+      };
+    }
+
+    if (!VALID_BLOOD_GROUPS.includes(stockData.bloodGroup)) {
+      return {
+        success: false,
+        insertedCount: 0,
+        error: `Invalid blood group: Must be one of ${VALID_BLOOD_GROUPS.join(', ')}.`,
+      };
+    }
+
+    // 4. Expiry date validation
     const expiryTime = new Date(stockData.expiryDate).getTime();
     if (isNaN(expiryTime)) {
-      return { success: false, insertedCount: 0, error: 'Invalid expiry date format.' };
+      return { success: false, insertedCount: 0, error: 'Invalid expiry date format: Must be a valid ISO date.' };
     }
 
     if (expiryTime <= Date.now()) {
@@ -191,15 +319,38 @@ export const hospitalDataService = {
       };
     }
 
-    if (!stockData.screeningPassed) {
-      return {
-        success: false,
-        insertedCount: 0,
-        error: 'Quality Control Alert: Unscreened or unverified units cannot be marked usable.',
-      };
+    // 5. Donation date validation
+    if (stockData.donationDate) {
+      const donationTime = new Date(stockData.donationDate).getTime();
+      if (isNaN(donationTime)) {
+        return { success: false, insertedCount: 0, error: 'Invalid donation date format: Must be a valid ISO date.' };
+      }
+      if (donationTime > Date.now() + 60000) {
+        return { success: false, insertedCount: 0, error: 'Invalid donation date: Donation date cannot be in the future.' };
+      }
+      if (donationTime >= expiryTime) {
+        return { success: false, insertedCount: 0, error: 'Invalid dates: Expiry date must be after donation date.' };
+      }
     }
 
-    // 2. Perform insert into Supabase if configured
+    // 6. Verification and Quarantine Status determination
+    // If screeningPassed is false, newly entered stock is not clinically cleared and must be QUARANTINED.
+    let determinedStatus: UnitStatus = 'AVAILABLE';
+    if (stockData.initialStatus === 'QUARANTINED') {
+      determinedStatus = 'QUARANTINED';
+    } else if (!stockData.screeningPassed) {
+      if (stockData.allowQuarantine) {
+        determinedStatus = 'QUARANTINED';
+      } else {
+        return {
+          success: false,
+          insertedCount: 0,
+          error: 'Quality Control Alert: Unscreened or unverified units cannot be marked usable. Register as Quarantined stock until serology clearance.',
+        };
+      }
+    }
+
+    // 7. Perform insert into Supabase if configured
     if (isSupabaseConfigured()) {
       try {
         const unitsToInsert = [];
@@ -208,7 +359,7 @@ export const hospitalDataService = {
             hospital_id: hospital.id,
             component_type: stockData.componentType,
             blood_group: stockData.bloodGroup,
-            unit_status: 'AVAILABLE',
+            unit_status: determinedStatus,
             expiry_at: stockData.expiryDate,
             created_at: stockData.donationDate || new Date().toISOString(),
           });
@@ -223,7 +374,8 @@ export const hospitalDataService = {
           return { success: false, insertedCount: 0, error: error.message };
         }
 
-        return { success: true, insertedCount: data?.length || stockData.quantity };
+        const ids = data ? data.map((d: any) => d.id) : [];
+        return { success: true, insertedCount: data?.length || stockData.quantity, unitIds: ids };
       } catch (err: any) {
         return { success: false, insertedCount: 0, error: err.message || 'Database error inserting stock' };
       }
@@ -233,15 +385,18 @@ export const hospitalDataService = {
     if (!memoryStock[hospital.id]) {
       memoryStock[hospital.id] = [];
     }
+    const createdIds: string[] = [];
     for (let i = 0; i < stockData.quantity; i++) {
+      const unitId = `unit-${Date.now()}-${i}`;
+      createdIds.push(unitId);
       const newUnit: BloodUnit = {
-        id: `unit-${Date.now()}-${i}`,
+        id: unitId,
         hospitalId: hospital.id,
         componentType: stockData.componentType,
         bloodGroup: stockData.bloodGroup,
         donationDate: stockData.donationDate || new Date().toISOString(),
         expiresAt: stockData.expiryDate,
-        status: 'AVAILABLE',
+        status: determinedStatus,
         handlingBufferMinutes: stockData.componentType === 'FFP' ? 35 : 25,
         storageTemperatureCelsius:
           stockData.storageTempCelsius ??
@@ -251,7 +406,125 @@ export const hospitalDataService = {
       memoryStock[hospital.id].unshift(newUnit);
     }
 
-    return { success: true, insertedCount: stockData.quantity };
+    return { success: true, insertedCount: stockData.quantity, unitIds: createdIds };
+  },
+
+  /**
+   * Verifies a quarantined unit and releases it to AVAILABLE usable inventory.
+   * Scoped to the active hospital and authorized operator.
+   */
+  async verifyAndReleaseQuarantine(
+    hospital: HospitalProfile,
+    unitId: string,
+    batchRef?: string
+  ): Promise<{ success: boolean; unitId?: string; error?: string }> {
+    const activeHospitalId = authService.getActiveHospitalId();
+    if (activeHospitalId && activeHospitalId !== hospital.id) {
+      return { success: false, error: 'Unauthorized: active session mismatch.' };
+    }
+
+    if (isSupabaseConfigured()) {
+      try {
+        const { data: rpcData, error: rpcError } = await supabase.rpc('verify_and_release_quarantined_unit', {
+          p_unit_id: unitId,
+          p_hospital_id: hospital.id,
+          p_batch_ref: batchRef || null,
+        });
+
+        if (!rpcError && rpcData?.success) {
+          return { success: true, unitId };
+        }
+
+        // Direct fallback update under RLS
+        const { error: updateError } = await supabase
+          .from('blood_units')
+          .update({ unit_status: 'AVAILABLE', updated_at: new Date().toISOString() })
+          .eq('id', unitId)
+          .eq('hospital_id', hospital.id)
+          .eq('unit_status', 'QUARANTINED')
+          .gt('expiry_at', new Date().toISOString());
+
+        if (updateError) {
+          return { success: false, error: updateError.message };
+        }
+        return { success: true, unitId };
+      } catch (err: any) {
+        return { success: false, error: err.message || 'Error releasing quarantined unit' };
+      }
+    }
+
+    // In-memory fallback
+    const units = memoryStock[hospital.id] || [];
+    const target = units.find((u) => u.id === unitId);
+    if (!target) {
+      return { success: false, error: 'Unit not found in hospital inventory.' };
+    }
+    if (target.status !== 'QUARANTINED') {
+      return { success: false, error: `Unit is in status '${target.status}', not QUARANTINED.` };
+    }
+    if (new Date(target.expiresAt).getTime() <= Date.now()) {
+      target.status = 'EXPIRED';
+      return { success: false, error: 'Cannot release: Unit has expired.' };
+    }
+
+    target.status = 'AVAILABLE';
+    return { success: true, unitId };
+  },
+
+  /**
+   * Discards a blood unit (e.g. failed QC, contaminated, or expired).
+   * Requires a mandatory clinical/operational reason and preserves unit audit history.
+   */
+  async discardUnit(
+    hospital: HospitalProfile,
+    unitId: string,
+    reason: string = 'Operator manual discard'
+  ): Promise<{ success: boolean; error?: string }> {
+    const trimmedReason = (reason || '').trim();
+    if (!trimmedReason) {
+      return { success: false, error: 'A discard reason is mandatory for clinical safety and regulatory traceability.' };
+    }
+
+    if (isSupabaseConfigured()) {
+      try {
+        const { error } = await supabase
+          .from('blood_units')
+          .update({ unit_status: 'DISCARDED', updated_at: new Date().toISOString() })
+          .eq('id', unitId)
+          .eq('hospital_id', hospital.id);
+
+        if (error) return { success: false, error: error.message };
+
+        // Attempt to log discard reason to audit trail table
+        try {
+          const { data: sessionData } = await supabase.auth.getSession();
+          const uid = sessionData?.session?.user?.id;
+          await supabase.from('blood_transfer_audit_log').insert({
+            actor_hospital_id: hospital.id,
+            actor_auth_user_id: uid || null,
+            action_type: 'REJECTED',
+            units_count: 1,
+            unit_ids: [unitId],
+            notes: `Discarded: ${trimmedReason}`,
+          });
+        } catch {
+          // Audit logging is non-blocking
+        }
+
+        return { success: true };
+      } catch (err: any) {
+        return { success: false, error: err.message };
+      }
+    }
+
+    const units = memoryStock[hospital.id] || [];
+    const target = units.find((u) => u.id === unitId);
+    if (target) {
+      target.status = 'DISCARDED';
+      (target as any).discardReason = trimmedReason;
+      (target as any).discardedAt = new Date().toISOString();
+    }
+    return { success: true };
   },
 
   /**
@@ -488,7 +761,10 @@ export const hospitalDataService = {
     }
 
     // In-memory fallback
-    const donorUnits = memoryStock[donorHospital.id] || [];
+    if (!memoryStock[donorHospital.id]) {
+      memoryStock[donorHospital.id] = [];
+    }
+    const donorUnits = memoryStock[donorHospital.id];
     let count = 0;
     donorUnits.forEach((u) => {
       if (count < quantityToApprove && u.status === 'AVAILABLE') {

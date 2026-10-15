@@ -84,6 +84,7 @@ export default function App() {
 
     try {
       const allList = availableHospitals && availableHospitals.length > 0 ? availableHospitals : userHospitalsRef.current;
+      await hospitalDataService.purgeConfirmedDemoRecords(hosp.id);
       const [localUnits, localReqs, localRecs] = await Promise.all([
         hospitalDataService.getHospitalInventory(hosp),
         hospitalDataService.getHospitalRequests(hosp),

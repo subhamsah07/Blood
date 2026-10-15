@@ -300,6 +300,7 @@ async function runTestSuite() {
   // --------------------------------------------------------------------------
   console.log('\n--- Test Case 4: Stock Registration & QC Validations ---');
   const fortis = JAIPUR_DEMO_HOSPITALS[0];
+  authService.setActiveHospitalId(fortis.id);
 
   // Expired stock rejection
   const expiredStockRes = await hospitalDataService.addBloodStock(fortis, {
@@ -400,6 +401,237 @@ async function runTestSuite() {
     !leakedPatientInfo,
     'Network recommendations do not leak private patient names or prescription details'
   );
+
+  // --------------------------------------------------------------------------
+  // TEST CASE 9: Phase 2 Inventory Module - Invalid Quantities Validation
+  // --------------------------------------------------------------------------
+  console.log('\n--- Test Case 9: Inventory Form - Invalid Quantities Validation ---');
+  authService.setActiveHospitalId(fortis.id);
+
+  // Zero quantity
+  const zeroQtyRes = await hospitalDataService.addBloodStock(fortis, {
+    componentType: 'PRBC',
+    bloodGroup: 'O_POS',
+    quantity: 0,
+    expiryDate: new Date(Date.now() + 30 * 24 * 3600 * 1000).toISOString(),
+    screeningPassed: true,
+  });
+  assert(
+    !zeroQtyRes.success && Boolean(zeroQtyRes.error?.toLowerCase().includes('quantity')),
+    'Quantity of 0 is rejected with validation error'
+  );
+
+  // Negative quantity
+  const negQtyRes = await hospitalDataService.addBloodStock(fortis, {
+    componentType: 'PRBC',
+    bloodGroup: 'O_POS',
+    quantity: -5,
+    expiryDate: new Date(Date.now() + 30 * 24 * 3600 * 1000).toISOString(),
+    screeningPassed: true,
+  });
+  assert(
+    !negQtyRes.success && Boolean(negQtyRes.error?.toLowerCase().includes('quantity')),
+    'Negative quantity (-5) is rejected with validation error'
+  );
+
+  // Decimal quantity
+  const decimalQtyRes = await hospitalDataService.addBloodStock(fortis, {
+    componentType: 'PRBC',
+    bloodGroup: 'O_POS',
+    quantity: 2.5,
+    expiryDate: new Date(Date.now() + 30 * 24 * 3600 * 1000).toISOString(),
+    screeningPassed: true,
+  });
+  assert(
+    !decimalQtyRes.success && Boolean(decimalQtyRes.error?.toLowerCase().includes('integer')),
+    'Decimal quantity (2.5) is rejected as non-integer'
+  );
+
+  // Excessively large quantity (>100)
+  const excessiveQtyRes = await hospitalDataService.addBloodStock(fortis, {
+    componentType: 'PRBC',
+    bloodGroup: 'O_POS',
+    quantity: 150,
+    expiryDate: new Date(Date.now() + 30 * 24 * 3600 * 1000).toISOString(),
+    screeningPassed: true,
+  });
+  assert(
+    !excessiveQtyRes.success && Boolean(excessiveQtyRes.error?.toLowerCase().includes('quantity')),
+    'Excessive quantity (150) exceeds batch ceiling limit of 100'
+  );
+
+  // --------------------------------------------------------------------------
+  // TEST CASE 10: Phase 2 Inventory Module - Invalid Dates Validation
+  // --------------------------------------------------------------------------
+  console.log('\n--- Test Case 10: Inventory Form - Invalid Dates Validation ---');
+
+  // Past expiry date
+  const pastExpiryRes = await hospitalDataService.addBloodStock(fortis, {
+    componentType: 'PLATELETS',
+    bloodGroup: 'A_POS',
+    quantity: 1,
+    expiryDate: new Date(Date.now() - 24 * 3600 * 1000).toISOString(),
+    screeningPassed: true,
+  });
+  assert(
+    !pastExpiryRes.success && Boolean(pastExpiryRes.error?.toLowerCase().includes('expired')),
+    'Past expiry date is strictly rejected'
+  );
+
+  // Malformed date string
+  const malformedDateRes = await hospitalDataService.addBloodStock(fortis, {
+    componentType: 'FFP',
+    bloodGroup: 'AB_POS',
+    quantity: 1,
+    expiryDate: 'invalid-not-a-date',
+    screeningPassed: true,
+  });
+  assert(
+    !malformedDateRes.success && Boolean(malformedDateRes.error?.toLowerCase().includes('date')),
+    'Malformed expiry date string is rejected'
+  );
+
+  // Future donation date
+  const futureDonationRes = await hospitalDataService.addBloodStock(fortis, {
+    componentType: 'PRBC',
+    bloodGroup: 'B_POS',
+    quantity: 1,
+    expiryDate: new Date(Date.now() + 35 * 24 * 3600 * 1000).toISOString(),
+    donationDate: new Date(Date.now() + 7 * 24 * 3600 * 1000).toISOString(), // 7 days in future
+    screeningPassed: true,
+  });
+  assert(
+    !futureDonationRes.success && Boolean(futureDonationRes.error?.toLowerCase().includes('future')),
+    'Future donation date is strictly rejected'
+  );
+
+  // Donation date after expiry date
+  const donationAfterExpiryRes = await hospitalDataService.addBloodStock(fortis, {
+    componentType: 'PRBC',
+    bloodGroup: 'B_POS',
+    quantity: 1,
+    expiryDate: new Date(Date.now() + 5 * 24 * 3600 * 1000).toISOString(),
+    donationDate: new Date(Date.now() + 10 * 24 * 3600 * 1000).toISOString(),
+    screeningPassed: true,
+  });
+  assert(
+    !donationAfterExpiryRes.success,
+    'Donation date after expiry date is rejected'
+  );
+
+  // --------------------------------------------------------------------------
+  // TEST CASE 11: Phase 2 Inventory Module - Unauthorized Writes
+  // --------------------------------------------------------------------------
+  console.log('\n--- Test Case 11: Scoped Authorization - Cross-Facility Write Prevention ---');
+  // Set session active hospital to Fortis (#1)
+  authService.setActiveHospitalId(fortis.id);
+
+  // Attempt to write stock to Narayana (#3) while active session is scoped to Fortis
+  const unauthorizedWriteRes = await hospitalDataService.addBloodStock(narayana, {
+    componentType: 'PRBC',
+    bloodGroup: 'O_NEG',
+    quantity: 2,
+    expiryDate: new Date(Date.now() + 30 * 24 * 3600 * 1000).toISOString(),
+    screeningPassed: true,
+  });
+  assert(
+    !unauthorizedWriteRes.success && Boolean(unauthorizedWriteRes.error?.toLowerCase().includes('authorization')),
+    'Cross-facility inventory write without active hospital scope is rejected'
+  );
+
+  // --------------------------------------------------------------------------
+  // TEST CASE 12: Phase 2 Inventory Module - Quarantine & Verification Workflow
+  // --------------------------------------------------------------------------
+  console.log('\n--- Test Case 12: Quarantine Holding & Clinical Verification Workflow ---');
+  authService.setActiveHospitalId(fortis.id);
+
+  // Register fresh batch into quarantine
+  const quarantineAddRes = await hospitalDataService.addBloodStock(fortis, {
+    componentType: 'PLATELETS',
+    bloodGroup: 'O_POS',
+    quantity: 2,
+    expiryDate: new Date(Date.now() + 4 * 24 * 3600 * 1000).toISOString(),
+    screeningPassed: false, // Testing pending
+    initialStatus: 'QUARANTINED',
+    allowQuarantine: true,
+    batchRef: 'QC-BATCH-TEST-99',
+  });
+  assert(
+    quarantineAddRes.success && quarantineAddRes.insertedCount === 2,
+    'Unscreened stock successfully enters inventory in QUARANTINED state'
+  );
+
+  // Verify that quarantined units are NOT treated as AVAILABLE
+  const fortisInventory = await hospitalDataService.getHospitalInventory(fortis);
+  const quarantinedFound = fortisInventory.filter((u) => u.status === 'QUARANTINED');
+  assert(
+    quarantinedFound.length >= 2,
+    'Quarantined units are retained with status QUARANTINED in inventory'
+  );
+
+  // Test verify and release from quarantine
+  const unitToRelease = quarantinedFound[0];
+  const releaseRes = await hospitalDataService.verifyAndReleaseQuarantine(fortis, unitToRelease.id, 'LAB-QC-PASSED-101');
+  assert(
+    releaseRes.success && releaseRes.unitId === unitToRelease.id,
+    'Authorized operator can verify serology and release quarantined unit to AVAILABLE'
+  );
+
+  const updatedInventory = await hospitalDataService.getHospitalInventory(fortis);
+  const releasedUnit = updatedInventory.find((u) => u.id === unitToRelease.id);
+  assert(
+    releasedUnit?.status === 'AVAILABLE',
+    'Released unit successfully transitions to AVAILABLE usable status'
+  );
+
+  // --------------------------------------------------------------------------
+  // TEST CASE 13: Phase 2 Inventory Module - Reserved Stock Protection
+  // --------------------------------------------------------------------------
+  console.log('\n--- Test Case 13: Reserved Stock Inviolability ---');
+  // Attempt to approve/reserve more units than available should be blocked
+  const excessiveReqRes = await hospitalDataService.createBloodRequest(fortis, {
+    componentType: 'CRYOPRECIPITATE',
+    bloodGroup: 'AB_POS',
+    quantity: 999, // Way more than any hospital has
+    urgency: 'ROUTINE',
+    requiredBy: new Date(Date.now() + 24 * 3600 * 1000).toISOString(),
+    clinicalJustification: 'Massive burn ward reserve requirement',
+  });
+
+  const excessiveApproveRes = await hospitalDataService.approveIncomingRequest(narayana, excessiveReqRes.requestId!, 999);
+  // Should only approve up to available count, never creating phantom units
+  assert(
+    excessiveApproveRes.approvedCount < 999,
+    'Reservation cannot exceed actual unreserved physical stock'
+  );
+
+  // --------------------------------------------------------------------------
+  // TEST CASE 14: Phase 2 Inventory Module - Hospital Switching Across 4 Jaipur Facilities
+  // --------------------------------------------------------------------------
+  console.log('\n--- Test Case 14: Switching Across All Four Jaipur Hospitals ---');
+  for (let i = 0; i < JAIPUR_DEMO_HOSPITALS.length; i++) {
+    const hosp = JAIPUR_DEMO_HOSPITALS[i];
+    authService.setActiveHospitalId(hosp.id);
+
+    const hospInventory = await hospitalDataService.getHospitalInventory(hosp);
+    assert(
+      Array.isArray(hospInventory) && hospInventory.every((u) => u.hospitalId === hosp.id),
+      `Hospital #${i + 1} (${hosp.name}) inventory strictly contains only units belonging to hospital ID ${hosp.id}`
+    );
+
+    // Verify FEFO sorting (earliest expiry first)
+    let isFefoSorted = true;
+    for (let k = 0; k < hospInventory.length - 1; k++) {
+      if (new Date(hospInventory[k].expiresAt).getTime() > new Date(hospInventory[k + 1].expiresAt).getTime()) {
+        isFefoSorted = false;
+        break;
+      }
+    }
+    assert(
+      isFefoSorted,
+      `Hospital #${i + 1} inventory is strictly sorted by earliest expiry date (FEFO)`
+    );
+  }
 
   console.log(`\n======================================================`);
   console.log(`TEST RESULTS: ${passedCount} PASSED, ${failedCount} FAILED`);

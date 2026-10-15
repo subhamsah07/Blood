@@ -7,7 +7,7 @@ export type BloodComponentType = 'PRBC' | 'PLATELETS' | 'FFP' | 'CRYOPRECIPITATE
 
 export type BloodGroup = 'O_NEG' | 'O_POS' | 'A_NEG' | 'A_POS' | 'B_NEG' | 'B_POS' | 'AB_NEG' | 'AB_POS';
 
-export type UnitStatus = 'AVAILABLE' | 'RESERVED' | 'IN_TRANSIT' | 'RECEIVED' | 'EXPIRED' | 'DISCARDED';
+export type UnitStatus = 'AVAILABLE' | 'RESERVED' | 'IN_TRANSIT' | 'RECEIVED' | 'EXPIRED' | 'DISCARDED' | 'QUARANTINED';
 
 export type RequestUrgency = 'CRITICAL_TRAUMA' | 'URGENT_SURGERY' | 'ROUTINE';
 
