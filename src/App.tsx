@@ -11,7 +11,6 @@ import {
 import { apiClient } from './services/apiClient';
 import { authService, HospitalProfile } from './services/authService';
 import { hospitalDataService, NetworkRecommendation } from './services/hospitalDataService';
-import { MedicalDisclaimer } from './components/MedicalDisclaimer';
 import { TopNav } from './components/TopNav';
 import { MainDashboard } from './components/MainDashboard';
 import { HospitalDashboardView } from './components/HospitalDashboardView';
@@ -244,10 +243,7 @@ export default function App() {
 
   return (
     <div className="min-h-screen bg-slate-50 flex flex-col font-sans text-slate-900 selection:bg-blue-100 selection:text-blue-900">
-      {/* 1. Mandatory Scientific & Clinical Disclaimer */}
-      <MedicalDisclaimer />
-
-      {/* 2. Top Navigation Bar with Hospital Switcher */}
+      {/* Top Navigation Bar with Hospital Switcher */}
       <TopNav
         onOpenLogin={() => setIsLoginModalOpen(true)}
         onOpenContactUs={scrollToContact}
@@ -313,16 +309,6 @@ export default function App() {
               }`}
             >
               Hospital Dashboard
-            </button>
-            <button
-              onClick={() => setCurrentView('allocation_studio')}
-              className={`px-3 py-1.5 rounded-lg font-semibold transition-colors cursor-pointer ${
-                currentView === 'allocation_studio'
-                  ? 'bg-blue-600 text-white'
-                  : 'bg-slate-100 text-slate-700 hover:bg-slate-200'
-              }`}
-            >
-              Centralized Allocation Studio
             </button>
           </div>
         </div>

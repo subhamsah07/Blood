@@ -223,6 +223,55 @@ export const hospitalDataService = {
   },
 
   /**
+   * Returns the count of genuine clinically available blood units across the 4 network hospitals.
+   * Excludes confirmed demo/synthetic units, expired units, and quarantined/reserved units.
+   */
+  async getRealAvailableUnitsCount(): Promise<number> {
+    const allHospitals = JAIPUR_DEMO_HOSPITALS;
+    const seenIds = new Set<string>();
+    let availableCount = 0;
+    const nowMs = Date.now();
+
+    // 1. Check live database if configured
+    if (isSupabaseConfigured()) {
+      try {
+        const { data, error } = await supabase
+          .from('blood_units')
+          .select('id, hospital_id, unit_status, expiry_at')
+          .eq('unit_status', 'AVAILABLE')
+          .gt('expiry_at', new Date().toISOString());
+
+        if (!error && data) {
+          for (const row of data) {
+            if (!row.id || seenIds.has(row.id)) continue;
+            if (this.isConfirmedDemoRecord(row)) continue;
+            if (new Date(row.expiry_at).getTime() <= nowMs) continue;
+            seenIds.add(row.id);
+            availableCount++;
+          }
+        }
+      } catch (e) {
+        console.warn('[HospitalDataService] Note querying live blood_units count:', e);
+      }
+    }
+
+    // 2. Also check memoryStock for the 4 network hospitals
+    for (const hosp of allHospitals) {
+      const memUnits = memoryStock[hosp.id] || [];
+      for (const u of memUnits) {
+        if (!u.id || seenIds.has(u.id)) continue;
+        if (this.isConfirmedDemoRecord(u)) continue;
+        if (u.status === 'AVAILABLE' && new Date(u.expiresAt).getTime() > nowMs) {
+          seenIds.add(u.id);
+          availableCount++;
+        }
+      }
+    }
+
+    return availableCount;
+  },
+
+  /**
    * Fetches active blood requests created by the active hospital.
    */
   async getHospitalRequests(hospital: HospitalProfile): Promise<BloodRequest[]> {
@@ -400,6 +449,28 @@ export const hospitalDataService = {
         }
 
         const ids = data ? data.map((d: any) => d.id) : [];
+        if (!memoryStock[hospital.id]) {
+          memoryStock[hospital.id] = [];
+        }
+        for (let i = 0; i < ids.length; i++) {
+          const unitId = ids[i];
+          if (!memoryStock[hospital.id].some((u) => u.id === unitId)) {
+            memoryStock[hospital.id].unshift({
+              id: unitId,
+              hospitalId: hospital.id,
+              componentType: stockData.componentType,
+              bloodGroup: stockData.bloodGroup,
+              donationDate: stockData.donationDate || new Date().toISOString(),
+              expiresAt: stockData.expiryDate,
+              status: determinedStatus,
+              handlingBufferMinutes: stockData.componentType === 'FFP' ? 35 : 25,
+              storageTemperatureCelsius:
+                stockData.storageTempCelsius ??
+                (stockData.componentType === 'PRBC' ? 4 : stockData.componentType === 'PLATELETS' ? 22 : -20),
+              syntheticBatchId: stockData.batchRef || `BATCH-${Date.now().toString(36).toUpperCase()}`,
+            });
+          }
+        }
         return { success: true, insertedCount: data?.length || stockData.quantity, unitIds: ids };
       } catch (err: any) {
         return { success: false, insertedCount: 0, error: err.message || 'Database error inserting stock' };

@@ -1,6 +1,5 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import {
-  Building2,
   Phone,
   Clock,
   ShieldCheck,
@@ -19,13 +18,14 @@ import {
   ArrowRight,
 } from 'lucide-react';
 import { Hospital, BloodUnit, BloodRequest } from '../types/bloodstock';
+import { hospitalDataService } from '../services/hospitalDataService';
 
 interface MainDashboardProps {
   hospitals: Hospital[];
   units: BloodUnit[];
   requests: BloodRequest[];
   onOpenLogin: () => void;
-  onOpenHospitalList: () => void;
+  onOpenHospitalList?: () => void;
   onOpenContactUs: () => void;
   onOpenEmergencyRequest: () => void;
   simulationTime: string;
@@ -47,6 +47,25 @@ export const MainDashboard: React.FC<MainDashboardProps> = ({
   const [contactEmail, setContactEmail] = useState('');
   const [contactMessage, setContactMessage] = useState('');
   const [contactSent, setContactSent] = useState(false);
+  const [realAvailableCount, setRealAvailableCount] = useState<number | null>(null);
+
+  useEffect(() => {
+    let isMounted = true;
+    const fetchRealUnits = async () => {
+      try {
+        const count = await hospitalDataService.getRealAvailableUnitsCount();
+        if (isMounted) setRealAvailableCount(count);
+      } catch {
+        if (isMounted) setRealAvailableCount(0);
+      }
+    };
+    fetchRealUnits();
+    window.addEventListener('focus', fetchRealUnits);
+    return () => {
+      isMounted = false;
+      window.removeEventListener('focus', fetchRealUnits);
+    };
+  }, []);
 
   const handleContactSubmit = (e: React.FormEvent) => {
     e.preventDefault();
@@ -60,7 +79,7 @@ export const MainDashboard: React.FC<MainDashboardProps> = ({
     }, 3000);
   };
 
-  const availableCount = units.filter((u) => u.status === 'AVAILABLE').length;
+  const displayAvailableCount = realAvailableCount !== null ? realAvailableCount : 0;
 
   return (
     <div className="space-y-16 pb-16 animate-in fade-in duration-300">
@@ -100,7 +119,7 @@ export const MainDashboard: React.FC<MainDashboardProps> = ({
             A specialized healthcare logistics platform that models biological compatibility, expiry deadlines, cold-chain transport times, and protected safety reserves to recommend optimal, explainable multi-hospital transfers without double-allocation.
           </p>
 
-          {/* 3 Buttons on the Image (Login, Emergency Request, Hospital List) as requested */}
+          {/* Action Buttons on the Hero Image */}
           <div className="flex flex-wrap items-center gap-4 pt-4">
             {/* 1. Login Button */}
             <button
@@ -119,26 +138,17 @@ export const MainDashboard: React.FC<MainDashboardProps> = ({
               <Flame className="w-4 h-4 fill-white" />
               <span>Emergency Blood Request</span>
             </button>
-
-            {/* 3. Hospital List Button (White / Blue) */}
-            <button
-              onClick={onOpenHospitalList}
-              className="py-3 px-6 bg-white hover:bg-slate-100 active:bg-slate-200 text-blue-900 font-bold rounded-xl text-xs uppercase tracking-wider transition-all shadow-lg flex items-center gap-2 cursor-pointer border border-white"
-            >
-              <Building2 className="w-4 h-4 text-blue-700" />
-              <span>Hospital List</span>
-            </button>
           </div>
 
           {/* Live Quick Counter Badges on Image */}
           <div className="pt-6 border-t border-white/15 grid grid-cols-3 gap-4 font-mono max-w-lg">
             <div>
               <span className="text-[11px] text-slate-300 uppercase tracking-wider block">Network Facilities</span>
-              <strong className="text-xl font-bold text-white">{hospitals.length} Hospitals</strong>
+              <strong className="text-xl font-bold text-white">4 Hospitals</strong>
             </div>
             <div>
               <span className="text-[11px] text-slate-300 uppercase tracking-wider block">Available Units</span>
-              <strong className="text-xl font-bold text-emerald-300">{availableCount} Units</strong>
+              <strong className="text-xl font-bold text-emerald-300">{displayAvailableCount} Units</strong>
             </div>
             <div>
               <span className="text-[11px] text-slate-300 uppercase tracking-wider block">Double Allocations</span>
@@ -359,8 +369,18 @@ export const MainDashboard: React.FC<MainDashboardProps> = ({
             <div className="flex items-center gap-3">
               <Mail className="w-4 h-4 text-blue-600 shrink-0" />
               <div>
+                <strong className="text-slate-900 block">Helpline Email:</strong>
+                <a href="mailto:bloodraise.helpline@gmail.com" className="font-mono text-blue-700 hover:underline">
+                  bloodraise.helpline@gmail.com
+                </a>
+              </div>
+            </div>
+
+            <div className="flex items-center gap-3">
+              <Mail className="w-4 h-4 text-slate-400 shrink-0" />
+              <div>
                 <strong className="text-slate-900 block">Dispatch Email:</strong>
-                <span className="font-mono">dispatch@bloodstock.health</span>
+                <span className="font-mono text-slate-600">dispatch@bloodstock.health</span>
               </div>
             </div>
 

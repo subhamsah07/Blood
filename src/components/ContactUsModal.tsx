@@ -76,6 +76,13 @@ export const ContactUsModal: React.FC<ContactUsModalProps> = ({ isOpen, onClose 
 
               <div className="flex items-center gap-2.5 font-mono">
                 <Mail className="w-4 h-4 text-sky-600 shrink-0" />
+                <a href="mailto:bloodraise.helpline@gmail.com" className="hover:underline text-sky-800 font-bold">
+                  bloodraise.helpline@gmail.com
+                </a>
+              </div>
+
+              <div className="flex items-center gap-2.5 font-mono text-slate-500 text-[11px]">
+                <Mail className="w-3.5 h-3.5 text-slate-400 shrink-0" />
                 <span>dispatch@bloodstock.health</span>
               </div>
 

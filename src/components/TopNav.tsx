@@ -74,16 +74,6 @@ export const TopNav: React.FC<TopNavProps> = ({
             >
               Hospital Dashboard
             </button>
-            <button
-              onClick={() => onSelectView('allocation_studio')}
-              className={`px-3 py-1.5 rounded-lg transition-all cursor-pointer ${
-                currentView === 'allocation_studio'
-                  ? 'bg-white text-blue-700 font-bold shadow-xs'
-                  : 'text-slate-600 hover:text-slate-900'
-              }`}
-            >
-              Centralized Allocation Studio
-            </button>
           </div>
         )}
 
